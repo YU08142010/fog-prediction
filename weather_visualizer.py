@@ -742,6 +742,26 @@ def train_location_models(main_df, phenom_df, phenom_cols, location_mapping):
         "■ 地点ごとの現象コード予測モデルを学習（scikit-learn RandomForestClassifier・多クラス分類）"
     )
     print("=" * 60)
+
+    dummy_blocks_by_col = {
+        col: find_dummy_blocks(phenom_df, col) for col in phenom_cols
+    }
+    all_warnings = []
+    for col, blocks in dummy_blocks_by_col.items():
+        loc_name = location_mapping.get(col, col)
+        for start, end, ratio, n in blocks:
+            all_warnings.append(
+                f"{loc_name}: {start.strftime('%Y/%m/%d')}〜{end.strftime('%Y/%m/%d')}（{n}件）は"
+                f"「/」の割合が{ratio:.1%}と極端に低く、ダミーデータの可能性があるため学習から除外します。"
+            )
+    if all_warnings:
+        print(
+            "【データ品質チェック】以下の期間はダミーデータの可能性があるため、学習から除外します:"
+        )
+        for w in all_warnings:
+            print(f"  ⚠ {w}")
+        print()
+
     print(f"{'地点名':<14} {'件数':>7} {'クラス数':>8} {'正解率':>7} {'F1':>6}  結果")
     print("-" * 60)
 
@@ -749,6 +769,11 @@ def train_location_models(main_df, phenom_df, phenom_cols, location_mapping):
     for col in phenom_cols:
         loc_name = location_mapping.get(col, col)
         sub = merged.dropna(subset=[col])
+
+        # ダミーと判定されたブロックの期間を学習データから除外する
+        for start, end, _, _ in dummy_blocks_by_col.get(col, []):
+            sub = sub[(sub["datetime"] < start) | (sub["datetime"] > end)]
+
         if len(sub) < MIN_ROWS_PER_LOCATION:
             print(
                 f"{loc_name:<14} {len(sub):>7} {'-':>8} {'-':>7} {'-':>6}  データ不足でスキップ"
@@ -881,6 +906,69 @@ def get_last_observed_datetime(phenom_df, col):
     if valid_dates.empty:
         return phenom_df["datetime"].max()
     return valid_dates.max()
+
+
+def find_dummy_blocks(
+    phenom_df,
+    col,
+    min_block_rows: int = 50,
+    gap_hours: float = 24 * 7,
+    max_slash_ratio: float = 0.02,
+):
+    """観測データを時間的な『まとまり(ブロック)』に分割し、各ブロックの中で
+    「/」(現象なし)が極端に少ない（＝ダミーデータの疑いがある）ブロックを検出する。
+
+    本物の観測なら大半は「/」のはずなので、まとまった件数があるのに「/」が
+    ほぼ皆無なブロックは、テスト用の仮の値である可能性が高いと判断する。
+    戻り値: [(開始日時, 終了日時, 「/」の割合, 件数), ...] の疑わしいブロックのリスト
+    """
+    codes = phenom_df[col].map(encode_phenomena_cell)
+    valid_mask = codes.notna()
+    valid_df = pd.DataFrame(
+        {
+            "datetime": phenom_df.loc[valid_mask, "datetime"].values,
+            "code": codes[valid_mask].values,
+        }
+    )
+    if valid_df.empty:
+        return []
+
+    # 時間差がgap_hours以上空いたら別ブロックとみなす
+    time_diff = valid_df["datetime"].diff().dt.total_seconds() / 3600
+    block_id = (time_diff > gap_hours).cumsum()
+
+    suspicious = []
+    for _, block in valid_df.groupby(block_id):
+        if len(block) < min_block_rows:
+            continue
+        slash_ratio = (block["code"] == 0).mean()
+        if slash_ratio <= max_slash_ratio:
+            suspicious.append(
+                (
+                    block["datetime"].min(),
+                    block["datetime"].max(),
+                    slash_ratio,
+                    len(block),
+                )
+            )
+    return suspicious
+
+
+def check_dummy_data_warning(phenom_df, col, location_mapping):
+    """この地点にダミーデータらしきブロックが含まれていないかチェックし、
+    見つかった場合は警告メッセージ（複数件あれば複数行）のリストを返す。
+    """
+    blocks = find_dummy_blocks(phenom_df, col)
+    if not blocks:
+        return []
+    loc_name = location_mapping.get(col, col)
+    messages = []
+    for start, end, ratio, n in blocks:
+        messages.append(
+            f"{loc_name}: {start.strftime('%Y/%m/%d')}〜{end.strftime('%Y/%m/%d')}（{n}件）は"
+            f"「/」の割合が{ratio:.1%}と極端に低く、ダミーデータの可能性があります。"
+        )
+    return messages
 
 
 def plot_single_location_forecast(
