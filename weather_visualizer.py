@@ -1,16 +1,17 @@
 # -*- coding: utf-8 -*-
 """
 気象庁ダウンロード形式データ（只見_2026年1_5月_気象データ.xlsx など）を
-自動で読み込んでグラフ化するプログラム。
+自動で読み込んでグラフ化・霧予測するプログラム。
 
 【読み込む気象データ】
+  A列: 年月日時（1時間ごと）
   B列: 気温(℃)
-  C列: 降水量(mm)
-  D列: 風速(m/s)
-  G列: 相対湿度(％)
-  H列: 露点温度(℃)
+  E列: 降水量(mm)
+  H列: 風速(m/s)
+  S列: 露点温度(℃)
+  V列: 相対湿度(％)
 
-【J〜AP列（現象コード）】
+【AC〜BH列（現象コード・32地点）】
   "/"      = その時刻に現象なし
   空白     = まだデータ未入力
   1〜10    = 現象発生コード（下記の意味）
@@ -25,22 +26,20 @@
       9  霧雨
       10 雨
 
-【出力グラフ（5項目 × 月ごとに分割）】
-  ① 気温 × 現象コード（「/」・1〜10）
-  ② 降水量 × 現象コード
-  ③ 風速 × 現象コード
-  ④ 相対湿度 × 現象コード
-  ⑤ 露点温度 × 現象コード
+【出力グラフ】
+  ①② 月別の気象データ×現象コード（全32地点レーン）
+  ④   地点ごとの16日間予測グラフ（学習できた地点のみ）
+  ⑤   日別霧予測サマリー（全地点まとめ）
 
-  各グラフは、気象データの時系列（線 or 棒グラフ）と、
-  その時刻に記録された現象コード（「/」・1〜10）を“レーン”形式で
-  分けて表示する2段構成です。データ期間が長い場合に1枚の画像へ
-  詰め込みすぎて見づらくならないよう、「年-月」ごとにファイルを
-  分割して出力します（例: 5ヶ月分のデータなら、1項目につき5枚、
-  合計25枚のPNGが生成されます）。
+  ①②は気象データの時系列と現象コードを2段構成で表示します。
+  データ期間が長い場合に見づらくならないよう、「年-月」ごとにファイルを
+  分割して出力します（例: 5ヶ月分のデータなら、①②それぞれ5枚ずつ）。
 
 使い方:
-    python3 weather_visualizer.py 入力ファイル.xlsx [出力フォルダ]
+    python3 weather_visualizer.py 入力ファイル.xlsx [出力フォルダ] [--no-forecast]
+
+  --no-forecast を付けると、月別グラフ（①②）のみ生成し、
+  霧予測（④⑤）はスキップします。
 
 Jupyter / Google Colab で直接セルに貼って実行する場合は、
 下の DEFAULT_INPUT_FILE / DEFAULT_OUTPUT_DIR を編集してください。
@@ -52,7 +51,6 @@ import os
 import re
 import glob
 import subprocess
-import datetime
 
 import numpy as np
 import pandas as pd
@@ -62,18 +60,16 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.font_manager as fm
 from matplotlib.patches import Patch
-from matplotlib.collections import LineCollection
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter, column_index_from_string
 
 # --- 霧予測アドオン用の追加インポート ---
 import requests
-from sklearn.model_selection import train_test_split, RandomizedSearchCV
+from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, accuracy_score, f1_score
+from sklearn.metrics import accuracy_score, f1_score
 
 
 # ===========================================================================
@@ -233,13 +229,17 @@ def encode_phenomena_cell(value):
     if value is None:
         return np.nan
     if isinstance(value, (int, float)):
-        return float(value)
+        if np.isnan(value):
+            return np.nan
+        code = int(value)
+        return float(code) if 0 <= code <= 10 else np.nan
     s = str(value).strip()
     if s == "/":
         return 0.0
     nums = re.findall(r"\d+", s)
     if nums:
-        return float(max(int(n) for n in nums))
+        code = max(int(n) for n in nums)
+        return float(code) if 0 <= code <= 10 else np.nan
     return np.nan
 
 
@@ -310,7 +310,7 @@ def _draw_lane_panel(ax2, phenom_df, phenom_cols, location_mapping):
 
 def _finalize_figure(fig, ax1, ax2, times, fig_width):
     ax2.xaxis_date()
-    ax2.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d"))
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter("%Y/%m/%d"))
     n_ticks_target = max(10, int(fig_width / 1.3))
     ax2.xaxis.set_major_locator(
         mdates.AutoDateLocator(minticks=n_ticks_target, maxticks=n_ticks_target * 2)
@@ -436,6 +436,7 @@ def _resolve_input_file(filepath):
 
 
 def _parse_args():
+    skip_forecast = "--no-forecast" in sys.argv
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
     args = [a for a in args if a.lower().endswith((".xlsx", ".xls")) or os.path.isdir(a)]
     filepath = None
@@ -445,11 +446,11 @@ def _parse_args():
         else: out_dir = a
     if filepath is None: filepath = DEFAULT_INPUT_FILE
     if out_dir is None: out_dir = DEFAULT_OUTPUT_DIR
-    return filepath, out_dir
+    return filepath, out_dir, skip_forecast
 
 
 def main():
-    filepath, out_dir = _parse_args()
+    filepath, out_dir, skip_forecast = _parse_args()
     filepath = _resolve_input_file(filepath)
 
     if filepath is None:
@@ -472,6 +473,10 @@ def main():
 
     print(f"\nすべてのグラフが正常に生成されました！")
     print(f"出力先フォルダ: {out_dir} の中を確認してください。")
+
+    if skip_forecast:
+        print("\n【--no-forecast】霧予測（④⑤）の生成をスキップしました。")
+        return
 
     # === 【追加機能】霧予測モデルの学習・評価・16日間予測グラフ ===
     run_fog_prediction_addon(main_df, phenom_df, phenom_cols, location_name, out_dir, location_mapping)
@@ -508,8 +513,6 @@ def main():
 # ===========================================================================
 # 5. 霧予測モデル（追加機能・地点ごと個別予測版）
 # ---------------------------------------------------------------------------
-# 既存の可視化処理（1〜4）は一切変更していない。
-#
 # ・「32地点のどこかで霧」ではなく、【地点ごとに個別】の予測モデル
 #   （scikit-learn RandomForestClassifier）を学習する
 # ・元データと同じ粒度で予測する: 「/」(現象なし)+ コード1〜10 の
@@ -528,6 +531,8 @@ ML_FEATURES = [
     "気温(℃)", "降水量(mm)", "風速(m/s)", "相対湿度(％)", "露点温度(℃)",
     "気温露点差", "時_sin", "時_cos", "月",
 ]
+
+SUMMARY_FOG_CODES = {1, 2, 3, 4, 5, 6}  # サマリー集計・霧F1評価で「霧」とみなすコード
 
 # 地点ごとにモデルを学習するための最低条件（これを満たさない地点はスキップする）
 MIN_ROWS_PER_LOCATION = 200
@@ -565,6 +570,22 @@ def _add_time_features(df):
     return df
 
 
+def _temporal_train_test_split(X, y, test_ratio=0.2):
+    """時系列順を保ったまま、後ろ test_ratio をテストデータにする。"""
+    split_idx = max(1, int(len(X) * (1 - test_ratio)))
+    if split_idx >= len(X):
+        split_idx = len(X) - 1
+    return X.iloc[:split_idx], X.iloc[split_idx:], y.iloc[:split_idx], y.iloc[split_idx:]
+
+
+def _fog_class_f1(y_true, y_pred):
+    """霧コード(1〜6)に限定した macro F1。テストに霧が1件も無い場合は NaN。"""
+    fog_labels = [c for c in SUMMARY_FOG_CODES if c in set(y_true.unique())]
+    if not fog_labels:
+        return np.nan
+    return f1_score(y_true, y_pred, labels=fog_labels, average="macro", zero_division=0)
+
+
 def train_location_models(main_df, phenom_df, phenom_cols, location_mapping):
     """32地点それぞれについて、独立したRandomForestClassifier（多クラス分類）を学習する。
     予測対象は「/」(0) + コード1〜10 の11クラス（元データと同じ粒度）。
@@ -596,43 +617,38 @@ def train_location_models(main_df, phenom_df, phenom_cols, location_mapping):
             print(f"  ⚠ {w}")
         print()
 
-    print(f"{'地点名':<14} {'件数':>7} {'クラス数':>8} {'正解率':>7} {'F1':>6}  結果")
-    print("-" * 60)
+    print(f"{'地点名':<14} {'件数':>7} {'クラス数':>8} {'正解率':>7} {'F1':>6} {'霧F1':>6}  結果")
+    print("-" * 68)
 
     models = {}
     for col in phenom_cols:
         loc_name = location_mapping.get(col, col)
-        sub = merged.dropna(subset=[col])
+        sub = merged.dropna(subset=[col]).sort_values("datetime").reset_index(drop=True)
 
         # ダミーと判定されたブロックの期間を学習データから除外する
         for start, end, _, _ in dummy_blocks_by_col.get(col, []):
             sub = sub[(sub["datetime"] < start) | (sub["datetime"] > end)]
 
         if len(sub) < MIN_ROWS_PER_LOCATION:
-            print(f"{loc_name:<14} {len(sub):>7} {'-':>8} {'-':>7} {'-':>6}  データ不足でスキップ")
+            print(f"{loc_name:<14} {len(sub):>7} {'-':>8} {'-':>7} {'-':>6} {'-':>6}  データ不足でスキップ")
             continue
 
         y = sub[col].astype(int)
         class_counts = y.value_counts()
         n_classes = len(class_counts)
         if n_classes < MIN_CLASSES_PER_LOCATION:
-            print(f"{loc_name:<14} {len(sub):>7} {n_classes:>8} {'-':>7} {'-':>6}  現象の種類が少なくスキップ")
+            print(f"{loc_name:<14} {len(sub):>7} {n_classes:>8} {'-':>7} {'-':>6} {'-':>6}  現象の種類が少なくスキップ")
             continue
 
         X = sub[ML_FEATURES]
-        # サンプル数1件しかないクラスがあると層化分割できないため、その場合のみ層化なしにする
-        stratify_arg = y if class_counts.min() >= 2 else None
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, stratify=stratify_arg, random_state=42
-        )
+        X_train, X_test, y_train, y_test = _temporal_train_test_split(X, y)
 
         if y_train.nunique() < 2:
-            print(f"{loc_name:<14} {len(sub):>7} {n_classes:>8} {'-':>7} {'-':>6}  分割後クラス不足でスキップ")
+            print(f"{loc_name:<14} {len(sub):>7} {n_classes:>8} {'-':>7} {'-':>6} {'-':>6}  分割後クラス不足でスキップ")
             continue
 
-        # 「より正確に」との要望に対応: RandomizedSearchCVで地点ごとにハイパーパラメータを
-        # 自動探索する。ただし最小クラスの件数がCV分割数より少ない場合は探索できないため、
-        # その場合は既定値にフォールバックする。
+        # RandomizedSearchCVで地点ごとにハイパーパラメータを自動探索する。
+        # 時系列データのため TimeSeriesSplit を使い、未来データが学習に混ざらないようにする。
         base_pipe = Pipeline([
             ("scaler", StandardScaler()),
             ("model", RandomForestClassifier(
@@ -640,11 +656,12 @@ def train_location_models(main_df, phenom_df, phenom_cols, location_mapping):
             )),
         ])
 
-        n_splits = min(3, int(class_counts.min()))
-        if n_splits >= 2 and len(X_train) >= 30:
+        cv_splits = min(3, max(2, len(X_train) // 100))
+        if cv_splits >= 2 and len(X_train) >= 30:
             try:
+                tscv = TimeSeriesSplit(n_splits=cv_splits)
                 search = RandomizedSearchCV(
-                    base_pipe, PARAM_DIST, n_iter=10, cv=n_splits,
+                    base_pipe, PARAM_DIST, n_iter=10, cv=tscv,
                     scoring="accuracy", random_state=42, n_jobs=-1, error_score="raise",
                 )
                 search.fit(X_train, y_train)
@@ -664,18 +681,25 @@ def train_location_models(main_df, phenom_df, phenom_cols, location_mapping):
         y_pred = pipe.predict(X_test)
         acc = accuracy_score(y_test, y_pred)
         f1 = f1_score(y_test, y_pred, average="weighted", zero_division=0)
+        fog_f1 = _fog_class_f1(y_test, y_pred)
+        fog_f1_str = f"{fog_f1:>6.3f}" if not np.isnan(fog_f1) else f"{'-':>6}"
 
         tag = "学習完了(調整済)" if tuned else "学習完了(既定値)"
-        print(f"{loc_name:<14} {len(sub):>7} {n_classes:>8} {acc:>7.1%} {f1:>6.3f}  {tag}")
+        print(f"{loc_name:<14} {len(sub):>7} {n_classes:>8} {acc:>7.1%} {f1:>6.3f} {fog_f1_str}  {tag}")
         models[col] = {
-            "pipe": pipe, "accuracy": acc, "f1": f1,
+            "pipe": pipe, "accuracy": acc, "f1": f1, "fog_f1": fog_f1,
             "n": len(sub), "n_classes": n_classes, "classes": sorted(y.unique().tolist()),
         }
 
     if models:
         accs = [m["accuracy"] for m in models.values()]
-        print("-" * 60)
-        print(f"学習できた地点数: {len(models)} / {len(phenom_cols)}　平均正解率: {np.mean(accs):.1%}")
+        fog_f1s = [m["fog_f1"] for m in models.values() if not np.isnan(m["fog_f1"])]
+        print("-" * 68)
+        print(f"学習できた地点数: {len(models)} / {len(phenom_cols)}　平均正解率: {np.mean(accs):.1%}", end="")
+        if fog_f1s:
+            print(f"　平均霧F1: {np.mean(fog_f1s):.3f}")
+        else:
+            print("　（テストに霧が含まれる地点がなく、霧F1は算出不可）")
     else:
         print("\n【警告】どの地点も学習条件を満たさず、モデルを1つも作れませんでした。")
 
@@ -766,23 +790,6 @@ def find_dummy_blocks(phenom_df, col, min_block_rows: int = 50, gap_hours: float
         if slash_ratio <= max_slash_ratio:
             suspicious.append((block["datetime"].min(), block["datetime"].max(), slash_ratio, len(block)))
     return suspicious
-
-
-def check_dummy_data_warning(phenom_df, col, location_mapping):
-    """この地点にダミーデータらしきブロックが含まれていないかチェックし、
-    見つかった場合は警告メッセージ（複数件あれば複数行）のリストを返す。
-    """
-    blocks = find_dummy_blocks(phenom_df, col)
-    if not blocks:
-        return []
-    loc_name = location_mapping.get(col, col)
-    messages = []
-    for start, end, ratio, n in blocks:
-        messages.append(
-            f"{loc_name}: {start.strftime('%Y/%m/%d')}〜{end.strftime('%Y/%m/%d')}（{n}件）は"
-            f"「/」の割合が{ratio:.1%}と極端に低く、ダミーデータの可能性があります。"
-        )
-    return messages
 
 
 def plot_single_location_forecast(main_df, phenom_df, col, location_mapping,
@@ -897,9 +904,6 @@ def plot_single_location_forecast(main_df, phenom_df, col, location_mapping,
     return out_path
 
 
-SUMMARY_FOG_CODES = {1, 2, 3, 4, 5, 6}  # サマリー集計で「霧」とみなすコード
-
-
 def plot_all_location_summary(pred_df, models, location_mapping, location_name, out_dir):
     """32地点ぶんの予測結果をまとめ、日ごとに『霧(コード1〜6)が予測された地点数』を
     棒グラフにする。個別グラフを1枚ずつ見なくても全体感がつかめるようにするための追加機能。
@@ -1000,11 +1004,11 @@ def run_fog_prediction_addon(main_df, phenom_df, phenom_cols, location_name, out
             continue
 
         last_observed = get_last_observed_datetime(phenom_df, col)
-        gap_days = (forecast_raw["datetime"].min() - last_observed).days
+        gap_days = (forecast_raw["datetime"].min() - last_observed).total_seconds() / 86400
         if gap_days > 3:
             loc_name = location_mapping.get(col, col)
             print(f"  【注意】{loc_name}: 最後の観測記録（{last_observed.strftime('%Y/%m/%d')}）から"
-                  f"予報開始（{forecast_raw['datetime'].min().strftime('%Y/%m/%d')}）まで{gap_days}日の空白があります。")
+                  f"予報開始（{forecast_raw['datetime'].min().strftime('%Y/%m/%d')}）まで{gap_days:.1f}日の空白があります。")
 
         out_path = plot_single_location_forecast(
             main_df, phenom_df, col, location_mapping, forecast_raw, pred_df[col],
