@@ -67,7 +67,6 @@ from openpyxl.utils import get_column_letter, column_index_from_string
 import requests
 from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, f1_score
 
@@ -649,10 +648,17 @@ def train_location_models(main_df, phenom_df, phenom_cols, location_mapping):
 
         # RandomizedSearchCVで地点ごとにハイパーパラメータを自動探索する。
         # 時系列データのため TimeSeriesSplit を使い、未来データが学習に混ざらないようにする。
+        # 【改善】RandomForestは決定木ベースでスケール不変のため、StandardScalerは不要
+        # （精度への寄与がないまま計算コストだけ増える）。Pipelineは
+        # PARAM_DIST/set_paramsの "model__" プレフィックスをそのまま使うために
+        # 単一ステップ（"model"）のまま残している。
+        # 【改善】RandomForestClassifier側のn_jobsは既定値（並列化なし）にし、
+        # 並列化はRandomizedSearchCV側のn_jobs=-1にのみ任せる。
+        # 内側(モデル)と外側(探索)の両方でn_jobs=-1にすると、スレッドの
+        # 入れ子並列化（nested parallelism）が起きて競合し、かえって遅くなるため。
         base_pipe = Pipeline([
-            ("scaler", StandardScaler()),
             ("model", RandomForestClassifier(
-                class_weight="balanced_subsample", random_state=42, n_jobs=-1,
+                class_weight="balanced_subsample", random_state=42,
             )),
         ])
 
@@ -660,9 +666,13 @@ def train_location_models(main_df, phenom_df, phenom_cols, location_mapping):
         if cv_splits >= 2 and len(X_train) >= 30:
             try:
                 tscv = TimeSeriesSplit(n_splits=cv_splits)
+                # 【改善】「/」（現象なし）が大多数を占める不均衡データのため、
+                # accuracyだと「常に/と予測する」モデルでも高得点になりがち。
+                # 霧などの少数クラスもバランス良く評価するf1_macroを探索の
+                # 目的関数にする。
                 search = RandomizedSearchCV(
                     base_pipe, PARAM_DIST, n_iter=10, cv=tscv,
-                    scoring="accuracy", random_state=42, n_jobs=-1, error_score="raise",
+                    scoring="f1_macro", random_state=42, n_jobs=-1, error_score="raise",
                 )
                 search.fit(X_train, y_train)
                 pipe = search.best_estimator_
