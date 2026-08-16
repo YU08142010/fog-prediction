@@ -437,7 +437,6 @@ def _resolve_input_file(filepath):
 def _parse_args():
     skip_forecast = "--no-forecast" in sys.argv
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
-    args = [a for a in args if a.lower().endswith((".xlsx", ".xls")) or os.path.isdir(a)]
     filepath = None
     out_dir = None
     for a in args:
@@ -945,6 +944,12 @@ def plot_all_location_summary(pred_df, models, location_mapping, location_name, 
     ax.set_xlabel("日付")
     ax.set_title(f"【{location_name}】日ごとの霧予測サマリー（今後{len(dates)}日間）", fontsize=13)
     ax.grid(True, axis="y", alpha=0.3)
+
+    # 【改善】各バーの真下に必ず日付ラベル・縦線が来るよう、日付を1つずつ明示的に目盛りにする
+    # （AutoDateLocator任せだと隔日表示になり、どのバーがどの日か読み取りにくかったため）
+    ax.set_xticks(dates)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y/%m/%d"))
+    ax.grid(True, axis="x", alpha=0.25, linewidth=0.6)
     fig.autofmt_xdate()
 
     out_path = os.path.join(
