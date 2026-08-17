@@ -7,7 +7,7 @@
 1. **気温・湿度・風速・降水量などの気象データ**と、
 2. **各地点の川霧・層雲・霧雨などの現象コード**
 
-を月ごとにグラフ化し、さらに **scikit-learn（RandomForestClassifier）で地点ごとに霧の発生を学習**して、
+を月ごとにグラフ化し、さらに **RandomForest と XGBoost のハイブリッドモデルで地点ごとに霧の発生を学習**して、
 **Open-Meteo API から取得した今後16日間の気象予報**をもとに、地点ごとの霧予測グラフとCSVまで自動生成します。
 
 ---
@@ -48,7 +48,7 @@ run("data.csv")
 
 - グラフは `./output_graphs`（＝`/content/fog-prediction/output_graphs`）に保存され、**Colabのセル内にも表示されます**。
 - 日本語フォントが無い場合は、初回実行時に自動でインストールします（下の「日本語が □ になる場合」参照）。
-- 追加ライブラリのインストールは基本的に不要です（Colabに最初から入っています）。
+- 追加ライブラリのインストールは基本的に不要です（scikit-learn・xgboost も含めてColabに最初から入っています）。
 - 予測グラフ（④⑤⑥）の生成にはインターネット接続が必要です（Open-Meteo APIから予報を取得するため）。
 
 ### 3. 自分のデータで実行する
@@ -108,6 +108,7 @@ run(
     lon=139.3122,        # 　　　　〃　　　　　　経度
     forecast_days=16,    # 予報日数（Open-Meteoの上限は16）
     history_days=5,      # ④のグラフに表示する実測データの日数
+    model="hybrid",      # 学習モデル（"hybrid"=RF+XGBoost / "rf"=RandomForest単独 / "xgb"=XGBoost単独）
     forecast=True,       # False にすると霧予測（④⑤⑥）を作らない
     monthly=True,        # False にすると月別グラフ（①②）を作らない
     font=None,           # 使う日本語フォント名（例: "IPAexGothic"）
@@ -131,6 +132,7 @@ run(
 | `--lat` / `--lon` | 予報を取得する地点の緯度・経度 | 37.3486 / 139.3122（只見町付近） |
 | `--forecast-days N` | 予報を取得する日数（上限16） | 16 |
 | `--history-days N` | ④に表示する実測データの日数 | 5 |
+| `--model hybrid\|rf\|xgb` | 学習モデル（`hybrid`=RandomForest+XGBoostの加重平均／`rf`=RandomForest単独＝いちばん速い／`xgb`=XGBoost単独） | `hybrid` |
 | `--no-forecast` | 霧予測（④⑤⑥）を作らない | - |
 | `--no-monthly` | 月別グラフ（①②）を作らない | - |
 | `--font 名前` | グラフに使う日本語フォント名 | 自動 |
@@ -345,13 +347,25 @@ python -m unittest test_weather_visualizer
    - 時刻を sin/cos に変換したもの（0時と23時が近いことをモデルに教えるため）
    - 月
    - 風向の sin/cos（風向の列がある場合のみ。静穏は sin=cos=0）
-4. **モデル**：`RandomForestClassifier` を**地点それぞれに個別に学習**します。地点間でデータを混ぜることはしません。
-   - 評価用の train/test 分割は**時系列順を保ち**、後ろ20%をテストに使います（未来データが学習に混ざらないようにするため）
-   - `RandomizedSearchCV`（`TimeSeriesSplit`）で `n_estimators`・`max_depth`・`min_samples_leaf`・`max_features` を探索します
-   - 交差検証の分割数が足りない場合は探索をスキップし、既定値（`n_estimators=500, max_depth=14, min_samples_leaf=2`）にフォールバックします
+4. **モデル**：**RandomForest と XGBoost のハイブリッド**を**地点それぞれに個別に学習**します。地点間でデータを混ぜることはしません。
+   - 2つのモデルの**予測確率を加重平均**します（`確率 = w × RandomForest + (1 - w) × XGBoost`）。
+     RandomForest は少数・不均衡なデータで安定し、XGBoost は細かいパターンを拾いやすいという性質の違いを両取りするためです
+   - 混合比 `w` は **地点ごとに自動で決めます**（候補は 0 / 0.25 / 0.5 / 0.75 / 1.0）。
+     `w=1.0` は RandomForest 単独、`w=0.0` は XGBoost 単独と同じなので、**片方が明らかに良い地点では自動的にその片方だけが使われます**
+   - 評価用の train/test 分割は**時系列順を保ち**、後ろ20%をテストに使います（未来データが学習に混ざらないようにするため）。
+     混合比は**さらにその学習データの後ろ20%（検証期間）だけ**で選ぶので、テスト期間の成績が甘くなることはありません
+   - `RandomizedSearchCV`（`TimeSeriesSplit`）で、RandomForest は `n_estimators`・`max_depth`・`min_samples_leaf`・`max_features` を、
+     XGBoost は `n_estimators`・`max_depth`・`learning_rate`・`subsample`・`colsample_bytree`・`min_child_weight` を探索します
+   - 交差検証の分割数が足りない場合は探索をスキップし、既定値（RandomForest: `n_estimators=500, max_depth=14, min_samples_leaf=2` /
+     XGBoost: `n_estimators=300, max_depth=4, learning_rate=0.1`）にフォールバックします
    - データ件数が少なすぎる地点（200件未満）や、現象の種類が1種類しかない地点は自動的にスキップされます
-   - 学習後、地点ごとに正解率・F1スコア・**霧F1**（コード1〜6に限定した macro F1）を一覧表示します
+   - 学習後、地点ごとに正解率・F1スコア・**霧F1**（コード1〜6に限定した macro F1）・**採用した混合比**を一覧表示します
      （評価期間に現象が1種類しかない地点は「※正解率は参考値」と表示します。「/」が大多数だと正解率は簡単に高くなるため、霧の当たり具合は霧F1で確認してください）
+   - 表の最後に **`平均霧F1の内訳 → RandomForest単独: … / XGBoost単独: … / ハイブリッド: …`** を表示します。
+     ハイブリッドにして本当に良くなったかを毎回その場で確認できます
+   - **xgboost は Google Colab に標準で入っている**ため、Colabでは追加の作業は不要です。
+     入っていない環境では自動的に RandomForest 単独に切り替わります（その旨を表示します）。
+     学習時間が気になるときは `--model rf`（`run(..., model="rf")`）で従来どおりの速さに戻せます
 5. **予測**：Open-Meteo（無料・APIキー不要）から**実行した日（今日）以降**の気象予報を取得し、
    学習済みモデルで地点ごとの現象コードと霧確率を予測します。
    風速は `wind_speed_unit=ms` を指定して取得します（既定はkm/hで、指定しないと学習データ（m/s）と単位が食い違います）。
@@ -403,7 +417,9 @@ python -m unittest test_weather_visualizer
 | `find_dummy_blocks()` | 「/」がほぼ皆無なまとまった期間をダミーデータの疑いとして検出 |
 | `plot_temp_humid_dew()` / `plot_wind_precip()` | ①②のグラフを1ヶ月ぶん描画 |
 | `plot_combo_by_month()` | 月ごとに上記2つのグラフをまとめて生成 |
-| `train_location_models()` | 地点それぞれのRandomForestClassifierを学習 |
+| `train_location_models()` | 地点それぞれのモデル（既定=RandomForest+XGBoostのハイブリッド）を学習 |
+| `HybridFogClassifier` | RandomForestとXGBoostの予測確率を重み付き平均で混ぜるモデル |
+| `_choose_blend_weight()` | 検証期間の霧F1がいちばん高くなる混合比を地点ごとに選ぶ |
 | `fetch_forecast_range()` | Open-Meteoから今後16日分の気象予報を取得（風速はm/s） |
 | `build_location_forecast_codes()` | 予報に学習済みモデルを適用し、地点ごとの現象コードと霧確率を予測 |
 | `plot_single_location_forecast()` | ④の地点別予測グラフを1地点ぶん描画 |

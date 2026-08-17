@@ -3,4 +3,5 @@ numpy
 matplotlib
 openpyxl
 scikit-learn
+xgboost
 requests

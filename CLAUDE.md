@@ -7,7 +7,7 @@
 只見川流域の川霧を観測データからグラフ化し、機械学習で予測するプログラムです。
 
 - **実行環境の前提は Google Colab**。ローカルでも動きますが、日本語フォントの自動導入・ファイルのアップロード／ダウンロード支援は Colab に合わせて作られています。
-- 実体は **単一ファイル `weather_visualizer.py`（約2100行）** です。パッケージ化・モジュール分割はしていません。ファイル冒頭のモジュール docstring に全体仕様が書かれています。
+- 実体は **単一ファイル `weather_visualizer.py`（約2400行）** です。パッケージ化・モジュール分割はしていません。ファイル冒頭のモジュール docstring に全体仕様が書かれています。
 - ユーザーは Colab のセルに README のコードを貼って実行します。**README の手順がそのまま動くことが最優先の受け入れ条件**です。
 
 ## ファイル構成
@@ -15,10 +15,10 @@
 | ファイル | 役割 |
 |---|---|
 | `weather_visualizer.py` | 本体（読み込み・グラフ・学習・予測・CLI・Colab支援のすべて） |
-| `test_weather_visualizer.py` | unittest（51件）。ネットワークには接続しない |
+| `test_weather_visualizer.py` | unittest（63件）。ネットワークには接続しない |
 | `data.csv` | 動作確認用のサンプル（只見川流域4地点・2024年6〜9月） |
 | `README.md` | Colab利用者向けの手順書 |
-| `requirements.txt` | pandas / numpy / matplotlib / openpyxl / scikit-learn / requests |
+| `requirements.txt` | pandas / numpy / matplotlib / openpyxl / scikit-learn / xgboost / requests |
 | `review_point.md` | 利用者からの改善要望メモ |
 
 `output_graphs/` は出力先で `.gitignore` 済み。生成物はコミットしません。
@@ -34,7 +34,7 @@
 | 2 | セル値の正規化、日時パース、現象コード／風向の解釈 |
 | 3 | Excel/CSV読み込みと列レイアウトの自動検出 |
 | 4 | グラフ生成（上下2段構成・タイムライン同期） |
-| 5 | 霧予測モデル（地点ごとの多クラス分類） |
+| 5 | 霧予測モデル（地点ごとの多クラス分類。RandomForest+XGBoostのハイブリッド） |
 | 6 | 予測結果のグラフ・CSV出力 |
 | 7 | メイン実行部（`run()` / `main()`）と Colab 支援 |
 
@@ -81,6 +81,9 @@ python weather_visualizer.py --check-font
 - 降水量は列が無い／空欄なら **0mm** として学習に使います（無降水時に空欄という記録が多いため）。他の要素と同じ扱いにしないこと。
 - Open-Meteo の取得では `wind_speed_unit=ms` を必ず指定します。既定は km/h で、指定を落とすと学習データ（m/s）と単位が食い違い、予測が静かに壊れます。
 - 学習の train/test 分割は**時系列順を保った後ろ20%**です。シャッフル分割にすると未来のデータが学習に混ざります（`_temporal_train_test_split()`）。
+- ハイブリッドの混合比は**学習データのさらに後ろ20%（検証期間）だけ**で決めます（`_choose_blend_weight()`）。テスト期間で選ぶとスコアが甘くなります。
+- `xgboost` の import は try/except で囲み、無い環境では RandomForest 単独に降格します（`_HAS_XGBOOST` / `_resolve_model_kind()`）。この分岐を消さないこと。
+- XGBoost はラベルが 0,1,2,… と連続している必要があります。現象コードは歯抜けになるため、`_XGBLabelSafeClassifier` が符号化を担っています。XGBoost を直接使う書き方に戻さないこと。
 
 ### 出力ファイル名
 

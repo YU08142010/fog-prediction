@@ -17,6 +17,12 @@
       4  薄い全体霧  5  全体霧    6  全体濃い霧
       7  薄い層雲    8  濃い層雲  9  霧雨        10 雨
 
+【予測モデル】
+  地点ごとに RandomForest と XGBoost を学習し、予測確率を加重平均するハイブリッド。
+  混合比は地点ごとに検証期間（学習データの後ろ20%）の霧F1が最大になるよう自動決定します
+  （比率0または1＝片方単独も候補）。--model rf / --model xgb で片方だけにもできます。
+  xgboost はColabに標準搭載。無い環境では自動的にRandomForest単独へ切り替わります。
+
 【出力】
   ①② 月別の気象データ×現象コード（全地点レーン）
   ④   地点ごとの予測グラフ（実測＋今後の予報＋霧確率＋予測現象コード）
@@ -65,10 +71,22 @@ from openpyxl.utils import get_column_letter, column_index_from_string
 
 # --- 霧予測アドオン用の追加インポート ---
 import requests
+from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, f1_score
+from sklearn.utils.class_weight import compute_sample_weight
+
+# XGBoost は Google Colab には標準で入っている。入っていない環境
+# （素のローカル等）でもプログラム全体が動くよう、無ければ RandomForest 単独に
+# 自動フォールバックする（学習時にその理由を表示する）。
+try:
+    from xgboost import XGBClassifier
+    _HAS_XGBOOST = True
+except Exception:
+    XGBClassifier = None
+    _HAS_XGBOOST = False
 
 
 # ===========================================================================
@@ -1140,12 +1158,37 @@ SUMMARY_FOG_CODES = {1, 2, 3, 4, 5, 6}  # サマリー集計・霧F1評価・霧
 MIN_ROWS_PER_LOCATION = 200
 MIN_CLASSES_PER_LOCATION = 2  # 最低2種類以上の現象コードが記録されている必要がある
 
-# RandomizedSearchCVで探索するハイパーパラメータの範囲
+# RandomizedSearchCVで探索するハイパーパラメータの範囲（RandomForest）
 PARAM_DIST = {
     "model__n_estimators": [200, 300, 500],
     "model__max_depth": [6, 8, 10, 12, 14, None],
     "model__min_samples_leaf": [1, 2, 3, 5],
     "model__max_features": ["sqrt", "log2", None],
+}
+
+# 同じく XGBoost（勾配ブースティング）側の探索範囲。
+# 木を浅めにして学習率を小さめに振るのがブースティングの定石で、
+# 少数クラス（霧）が数十件しかない地点でも過学習しにくくする。
+XGB_PARAM_DIST = {
+    "model__n_estimators": [200, 400],
+    "model__max_depth": [3, 4, 6, 8],
+    "model__learning_rate": [0.05, 0.1, 0.2],
+    "model__subsample": [0.8, 1.0],
+    "model__colsample_bytree": [0.8, 1.0],
+    "model__min_child_weight": [1, 3, 5],
+}
+
+# ハイブリッドの混合比の候補（RandomForest側の重み）。
+# 0.0=XGBoost単独 / 1.0=RandomForest単独 も候補に含めているので、
+# 「片方が明らかに良い地点はその片方だけを使う」という判断も自動的に入る。
+BLEND_WEIGHTS = [0.0, 0.25, 0.5, 0.75, 1.0]
+
+MODEL_KINDS = ("hybrid", "rf", "xgb")
+DEFAULT_MODEL_KIND = "hybrid"
+MODEL_KIND_LABELS = {
+    "hybrid": "RandomForest + XGBoost のハイブリッド（予測確率を地点ごとの比率で加重平均）",
+    "rf": "RandomForest 単独",
+    "xgb": "XGBoost 単独",
 }
 
 
@@ -1232,11 +1275,227 @@ def compute_fog_probability(pipe, X):
     return proba[:, fog_idx].sum(axis=1)
 
 
-def train_location_models(main_df, phenom_df, phenom_cols, location_mapping):
-    """地点それぞれについて、独立したRandomForestClassifier（多クラス分類）を学習する。
+class _XGBLabelSafeClassifier(ClassifierMixin, BaseEstimator):
+    """XGBClassifier を「歯抜けの現象コード」でもそのまま学習できるようにする薄いラッパ。
 
-    戻り値: {列文字: {"pipe": Pipeline, "accuracy": float, "f1": float, "fog_f1": float,
-                      "n": int, "n_classes": int, "classes": list, "features": list}}
+    XGBoost はラベルが 0,1,2,… と連続していることを要求するが、現象コードは
+    地点によって {0,1,2,3,4,7,8,9,10} のように歯抜けになる。fit の中で
+    連番へ符号化し、classes_ と predict() は元の現象コードで返すため、
+    Pipeline / RandomizedSearchCV / f1_macro をRandomForestと同じ書き方で使える。
+
+    不均衡対策は RandomForest の class_weight="balanced_subsample" に相当する
+    sample_weight（balanced）を渡すことで行う。
+    """
+
+    def __init__(self, n_estimators=300, max_depth=4, learning_rate=0.1,
+                 subsample=1.0, colsample_bytree=1.0, min_child_weight=1,
+                 random_state=42):
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.learning_rate = learning_rate
+        self.subsample = subsample
+        self.colsample_bytree = colsample_bytree
+        self.min_child_weight = min_child_weight
+        self.random_state = random_state
+
+    def fit(self, X, y, sample_weight=None):
+        if not _HAS_XGBOOST:
+            raise RuntimeError("xgboost が導入されていません")
+        y = np.asarray(y)
+        self.classes_, encoded = np.unique(y, return_inverse=True)
+        self.n_features_in_ = np.asarray(X).shape[1]
+        if sample_weight is None:
+            sample_weight = compute_sample_weight("balanced", y)
+        # 内側のn_jobsは1に固定し、並列化は探索側のn_jobs=-1に任せる
+        # （RandomForest側と同じ方針。入れ子並列はスレッド競合で遅くなる）
+        self.model_ = XGBClassifier(
+            n_estimators=self.n_estimators, max_depth=self.max_depth,
+            learning_rate=self.learning_rate, subsample=self.subsample,
+            colsample_bytree=self.colsample_bytree,
+            min_child_weight=self.min_child_weight,
+            random_state=self.random_state, tree_method="hist", n_jobs=1,
+            verbosity=0,
+        )
+        self.model_.fit(X, encoded, sample_weight=sample_weight)
+        return self
+
+    def predict_proba(self, X):
+        return np.asarray(self.model_.predict_proba(X), dtype="float64")
+
+    def predict(self, X):
+        return self.classes_[np.argmax(self.predict_proba(X), axis=1)]
+
+
+class HybridFogClassifier:
+    """RandomForest と XGBoost の予測確率を重み付き平均で混ぜるハイブリッドモデル。
+
+        確率 = weight × RandomForest + (1 - weight) × XGBoost
+
+    weight は地点ごとに検証期間で自動決定する（`_choose_blend_weight()`）。
+    weight=1.0 は RandomForest 単独、0.0 は XGBoost 単独と同じ意味になる。
+
+    予測に使う下流のコード（`compute_fog_probability()` /
+    `build_location_forecast_codes()`）は classes_ / predict_proba / predict の
+    3つしか使わないため、このクラスもその3つだけを提供する。
+    """
+
+    def __init__(self, rf=None, xgb=None, weight=1.0):
+        if rf is None and xgb is None:
+            raise ValueError("rf と xgb の少なくとも一方が必要です")
+        if rf is None:
+            weight = 0.0
+        elif xgb is None:
+            weight = 1.0
+        self.rf = rf
+        self.xgb = xgb
+        self.weight = float(weight)
+        self.classes_ = np.asarray((rf if rf is not None else xgb).classes_)
+
+    @property
+    def model_type(self):
+        if self.rf is None:
+            return "xgb"
+        if self.xgb is None:
+            return "rf"
+        return "hybrid"
+
+    def describe(self):
+        """学習結果の表に出す「採用したモデル」の表示文字列。"""
+        if self.model_type == "rf":
+            return "RF単独"
+        if self.model_type == "xgb":
+            return "XGB単独"
+        return f"RF:XGB={self.weight:.2f}:{1 - self.weight:.2f}"
+
+    def _aligned_proba(self, model, X):
+        """モデルの確率を self.classes_ の並びに合わせて取り出す。"""
+        proba = np.asarray(model.predict_proba(X), dtype="float64")
+        model_classes = list(np.asarray(model.classes_))
+        if model_classes == list(self.classes_):
+            return proba
+        index = {c: i for i, c in enumerate(self.classes_)}
+        out = np.zeros((proba.shape[0], len(self.classes_)), dtype="float64")
+        for j, c in enumerate(model_classes):
+            if c in index:
+                out[:, index[c]] = proba[:, j]
+        return out
+
+    def predict_proba(self, X):
+        if self.xgb is None:
+            return self._aligned_proba(self.rf, X)
+        if self.rf is None:
+            return self._aligned_proba(self.xgb, X)
+        return (self.weight * self._aligned_proba(self.rf, X)
+                + (1.0 - self.weight) * self._aligned_proba(self.xgb, X))
+
+    def predict(self, X):
+        return self.classes_[np.argmax(self.predict_proba(X), axis=1)]
+
+
+# ハイパーパラメータ探索に失敗した／データが少なすぎて探索できないときの既定値
+RF_FALLBACK_PARAMS = dict(model__n_estimators=500, model__max_depth=14, model__min_samples_leaf=2)
+XGB_FALLBACK_PARAMS = dict(model__n_estimators=300, model__max_depth=4, model__learning_rate=0.1)
+
+
+def _make_base_pipe(kind):
+    """RandomForest / XGBoost の素のPipelineを作る。
+
+    どちらも決定木ベースでスケール不変のため StandardScaler は不要。
+    PARAM_DIST/set_params の "model__" プレフィックスを使うためPipelineのまま残す。
+    """
+    if kind == "rf":
+        return Pipeline([
+            ("model", RandomForestClassifier(class_weight="balanced_subsample", random_state=42)),
+        ])
+    return Pipeline([("model", _XGBLabelSafeClassifier())])
+
+
+def _fit_component(kind, X_train, y_train, loc_name):
+    """RandomForest または XGBoost を1つ学習する。
+
+    戻り値: (学習済みPipeline, 採用パラメータ, 探索できたか)
+    時系列データなのでTimeSeriesSplitを使い、未来データが学習に混ざらないようにする。
+    「/」が大多数の不均衡データではaccuracyだと「常に/」でも高得点になるため、
+    少数クラスも評価されるf1_macroを探索の目的関数にする。
+    """
+    label = "RandomForest" if kind == "rf" else "XGBoost"
+    param_dist = PARAM_DIST if kind == "rf" else XGB_PARAM_DIST
+    fallback_params = RF_FALLBACK_PARAMS if kind == "rf" else XGB_FALLBACK_PARAMS
+    n_iter = 10 if kind == "rf" else 8
+
+    cv_splits = min(3, max(2, len(X_train) // 100))
+    if cv_splits >= 2 and len(X_train) >= 30:
+        try:
+            search = RandomizedSearchCV(
+                _make_base_pipe(kind), param_dist, n_iter=n_iter,
+                cv=TimeSeriesSplit(n_splits=cv_splits),
+                scoring="f1_macro", random_state=42, n_jobs=-1, error_score="raise",
+            )
+            search.fit(X_train, y_train)
+            return search.best_estimator_, search.best_params_, True
+        except Exception as e:
+            print(f"  （{loc_name}: {label}のハイパーパラメータ探索に失敗したため既定値を使います: "
+                  f"{type(e).__name__}: {e}）")
+    pipe = _make_base_pipe(kind).set_params(**fallback_params)
+    pipe.fit(X_train, y_train)
+    return pipe, dict(fallback_params), False
+
+
+def _refit_component(kind, params, X_train, y_train):
+    """探索で決まったパラメータのまま、学習データ全体で学習し直す。"""
+    pipe = _make_base_pipe(kind).set_params(**params)
+    pipe.fit(X_train, y_train)
+    return pipe
+
+
+def _blend_score(y_true, y_pred):
+    """混合比を選ぶときの評価値。霧F1を優先し、検証期間に霧が無ければmacro F1。"""
+    score = _fog_class_f1(y_true, y_pred)
+    if np.isnan(score):
+        score = f1_score(y_true, y_pred, average="macro", zero_division=0)
+    return score
+
+
+def _choose_blend_weight(rf, xgb, X_val, y_val):
+    """検証期間で最も成績の良い混合比（RandomForest側の重み）を選ぶ。
+
+    戻り値: (重み, {重み: 評価値})
+    同点の場合はRandomForest寄り（＝従来どおりの安定側）を採用する。
+    """
+    scores = {}
+    best_w, best_score = 1.0, -1.0
+    for w in sorted(BLEND_WEIGHTS, reverse=True):  # RF寄りから順に見る＝同点はRF寄り優先
+        score = _blend_score(y_val, HybridFogClassifier(rf, xgb, weight=w).predict(X_val))
+        scores[w] = score
+        if score > best_score:
+            best_w, best_score = w, score
+    return best_w, scores
+
+
+def _resolve_model_kind(model):
+    """指定されたモデル種別を検証し、xgboostが無い環境ではrfへ降格させる。"""
+    kind = (model or DEFAULT_MODEL_KIND).lower()
+    if kind not in MODEL_KINDS:
+        raise ValueError(f"model は {MODEL_KINDS} のいずれかを指定してください（指定値: {model}）")
+    if kind in ("hybrid", "xgb") and not _HAS_XGBOOST:
+        print("  ※ xgboost が見つからないため RandomForest 単独で学習します"
+              "（`pip install xgboost` で有効になります。Google Colabには標準で入っています）")
+        return "rf"
+    return kind
+
+
+def train_location_models(main_df, phenom_df, phenom_cols, location_mapping,
+                          model=DEFAULT_MODEL_KIND):
+    """地点それぞれについて、独立した多クラス分類モデルを学習する。
+
+    model="hybrid"（既定）では RandomForest と XGBoost を両方学習し、
+    予測確率を地点ごとの最適な比率で混ぜ合わせる（`HybridFogClassifier`）。
+    model="rf" / "xgb" ならその片方だけを使う。
+
+    戻り値: {列文字: {"pipe": HybridFogClassifier, "accuracy": float, "f1": float,
+                      "fog_f1": float, "n": int, "n_classes": int, "classes": list,
+                      "features": list, "model_type": str, "blend_weight": float,
+                      "rf_fog_f1": float, "xgb_fog_f1": float}}
     （学習条件を満たさない地点は辞書に含めない＝その地点の予測グラフは作られない）
     """
     targets = build_location_class_targets(phenom_df, phenom_cols)
@@ -1246,8 +1505,10 @@ def train_location_models(main_df, phenom_df, phenom_cols, location_mapping):
     merged = merged.dropna(subset=feature_names)
 
     print("\n" + "=" * 66)
-    print("■ 地点ごとの現象コード予測モデルを学習（RandomForestClassifier・多クラス分類）")
+    print("■ 地点ごとの現象コード予測モデルを学習（多クラス分類）")
     print("=" * 66)
+    kind = _resolve_model_kind(model)
+    print(f"  学習方法      : {MODEL_KIND_LABELS[kind]}")
     print(f"  使用する特徴量: {', '.join(feature_names)}")
     if n_before - len(merged):
         print(f"  気象要素が欠測のため学習対象から外した行: {n_before - len(merged)}件 / {n_before}件")
@@ -1267,8 +1528,9 @@ def train_location_models(main_df, phenom_df, phenom_cols, location_mapping):
             print(f"  ⚠ {w}")
 
     print()
-    print(f"{'地点名':<16} {'件数':>7} {'クラス数':>8} {'正解率':>7} {'F1':>6} {'霧F1':>6}  結果")
-    print("-" * 72)
+    print(f"{'地点名':<16} {'件数':>7} {'クラス数':>8} {'正解率':>7} {'F1':>6} {'霧F1':>6} "
+          f"{'採用モデル':>14}  結果")
+    print("-" * 88)
 
     models = {}
     for col in phenom_cols:
@@ -1283,60 +1545,62 @@ def train_location_models(main_df, phenom_df, phenom_cols, location_mapping):
         if len(sub) < MIN_ROWS_PER_LOCATION:
             reason = ("ダミー判定で全期間を除外" if n_before_dummy and len(sub) == 0
                       else "データ不足でスキップ")
-            print(f"{loc_name:<16} {len(sub):>7} {'-':>8} {'-':>7} {'-':>6} {'-':>6}  {reason}")
+            print(f"{loc_name:<16} {len(sub):>7} {'-':>8} {'-':>7} {'-':>6} {'-':>6} "
+                  f"{'-':>14}  {reason}")
             continue
 
         y = sub[col].astype(int)
         class_counts = y.value_counts()
         n_classes = len(class_counts)
         if n_classes < MIN_CLASSES_PER_LOCATION:
-            print(f"{loc_name:<16} {len(sub):>7} {n_classes:>8} {'-':>7} {'-':>6} {'-':>6}  現象の種類が少なくスキップ")
+            print(f"{loc_name:<16} {len(sub):>7} {n_classes:>8} {'-':>7} {'-':>6} {'-':>6} "
+                  f"{'-':>14}  現象の種類が少なくスキップ")
             continue
 
         X = sub[feature_names]
         X_train, X_test, y_train, y_test = _temporal_train_test_split(X, y)
 
         if y_train.nunique() < 2:
-            print(f"{loc_name:<16} {len(sub):>7} {n_classes:>8} {'-':>7} {'-':>6} {'-':>6}  分割後クラス不足でスキップ")
+            print(f"{loc_name:<16} {len(sub):>7} {n_classes:>8} {'-':>7} {'-':>6} {'-':>6} "
+                  f"{'-':>14}  分割後クラス不足でスキップ")
             continue
 
-        # RandomForestは決定木ベースでスケール不変のため、StandardScalerは不要。
-        # PARAM_DIST/set_params の "model__" プレフィックスを使うためPipelineのまま残す。
-        # 内側(モデル)のn_jobsは既定のままにし、並列化は探索側のn_jobs=-1に任せる
-        # （入れ子並列化はスレッド競合でかえって遅くなるため）。
-        base_pipe = Pipeline([
-            ("model", RandomForestClassifier(class_weight="balanced_subsample", random_state=42)),
-        ])
-        fallback_params = dict(model__n_estimators=500, model__max_depth=14, model__min_samples_leaf=2)
-
-        cv_splits = min(3, max(2, len(X_train) // 100))
-        tuned = False
-        if cv_splits >= 2 and len(X_train) >= 30:
-            try:
-                # 時系列データなのでTimeSeriesSplitを使い、未来データが学習に混ざらないようにする。
-                # 「/」が大多数の不均衡データではaccuracyだと「常に/」でも高得点になるため、
-                # 少数クラスも評価されるf1_macroを探索の目的関数にする。
-                search = RandomizedSearchCV(
-                    base_pipe, PARAM_DIST, n_iter=10, cv=TimeSeriesSplit(n_splits=cv_splits),
-                    scoring="f1_macro", random_state=42, n_jobs=-1, error_score="raise",
-                )
-                search.fit(X_train, y_train)
-                pipe = search.best_estimator_
-                tuned = True
-            except Exception as e:
-                print(f"  （{loc_name}: ハイパーパラメータ探索に失敗したため既定値を使います: "
-                      f"{type(e).__name__}: {e}）")
-                pipe = base_pipe.set_params(**fallback_params)
-                pipe.fit(X_train, y_train)
+        rf_pipe = xgb_pipe = None
+        weight = 1.0
+        if kind == "hybrid":
+            # 混合比は「学習データのさらに後ろ20%（＝検証期間）」だけで決める。
+            # 評価用のテスト期間には一切触らないので、最終スコアが甘くならない。
+            X_inner, X_val, y_inner, y_val = _temporal_train_test_split(X_train, y_train)
+            if y_inner.nunique() >= 2 and len(X_val) >= 10:
+                rf_tmp, rf_params, rf_tuned = _fit_component("rf", X_inner, y_inner, loc_name)
+                xgb_tmp, xgb_params, xgb_tuned = _fit_component("xgb", X_inner, y_inner, loc_name)
+                weight, _ = _choose_blend_weight(rf_tmp, xgb_tmp, X_val, y_val)
+                # 比率が決まったら、検証期間も含めた学習データ全体で学習し直す
+                # （探索はしないので追加の計算コストは小さい）。
+                rf_pipe = _refit_component("rf", rf_params, X_train, y_train)
+                xgb_pipe = _refit_component("xgb", xgb_params, X_train, y_train)
+                tuned = rf_tuned and xgb_tuned
+            else:
+                # 検証期間を切り出せないほど小さい地点は、比率を半々に固定する
+                rf_pipe, _, rf_tuned = _fit_component("rf", X_train, y_train, loc_name)
+                xgb_pipe, _, xgb_tuned = _fit_component("xgb", X_train, y_train, loc_name)
+                weight, tuned = 0.5, rf_tuned and xgb_tuned
+        elif kind == "rf":
+            rf_pipe, _, tuned = _fit_component("rf", X_train, y_train, loc_name)
         else:
-            pipe = base_pipe.set_params(**fallback_params)
-            pipe.fit(X_train, y_train)
+            xgb_pipe, _, tuned = _fit_component("xgb", X_train, y_train, loc_name)
+
+        pipe = HybridFogClassifier(rf_pipe, xgb_pipe, weight=weight)
 
         y_pred = pipe.predict(X_test)
         acc = accuracy_score(y_test, y_pred)
         f1 = f1_score(y_test, y_pred, average="weighted", zero_division=0)
         fog_f1 = _fog_class_f1(y_test, y_pred)
         fog_f1_str = f"{fog_f1:>6.3f}" if not np.isnan(fog_f1) else f"{'-':>6}"
+        # 「ハイブリッドにして本当に良くなったのか」を利用者が確かめられるよう、
+        # 混ぜる前のRandomForest単独・XGBoost単独の霧F1も同じテスト期間で測っておく。
+        rf_fog_f1 = _fog_class_f1(y_test, rf_pipe.predict(X_test)) if rf_pipe is not None else np.nan
+        xgb_fog_f1 = _fog_class_f1(y_test, xgb_pipe.predict(X_test)) if xgb_pipe is not None else np.nan
 
         # テスト期間に現象が1種類しかない場合、正解率は「常に多数派を答える」だけで
         # 100%になってしまう。数字を鵜呑みにしないよう、その旨をここで明示する。
@@ -1344,22 +1608,32 @@ def train_location_models(main_df, phenom_df, phenom_cols, location_mapping):
         tag = "学習完了(調整済)" if tuned else "学習完了(既定値)"
         if eval_trivial:
             tag += " ※評価期間に現象1種のみ＝正解率は参考値"
-        print(f"{loc_name:<16} {len(sub):>7} {n_classes:>8} {acc:>7.1%} {f1:>6.3f} {fog_f1_str}  {tag}")
+        print(f"{loc_name:<16} {len(sub):>7} {n_classes:>8} {acc:>7.1%} {f1:>6.3f} {fog_f1_str} "
+              f"{pipe.describe():>14}  {tag}")
         models[col] = {
             "pipe": pipe, "accuracy": acc, "f1": f1, "fog_f1": fog_f1,
             "n": len(sub), "n_classes": n_classes, "classes": sorted(y.unique().tolist()),
             "features": feature_names, "eval_trivial": eval_trivial,
+            "model_type": pipe.model_type, "blend_weight": pipe.weight,
+            "rf_fog_f1": rf_fog_f1, "xgb_fog_f1": xgb_fog_f1,
         }
 
     if models:
         accs = [m["accuracy"] for m in models.values()]
-        fog_f1s = [m["fog_f1"] for m in models.values() if not np.isnan(m["fog_f1"])]
-        print("-" * 72)
+        scored = [m for m in models.values() if not np.isnan(m["fog_f1"])]
+        fog_f1s = [m["fog_f1"] for m in scored]
+        print("-" * 88)
         print(f"学習できた地点数: {len(models)} / {len(phenom_cols)}　平均正解率: {np.mean(accs):.1%}", end="")
         if fog_f1s:
             print(f"　平均霧F1: {np.mean(fog_f1s):.3f}")
         else:
             print("　（テストに霧が含まれる地点がなく、霧F1は算出不可）")
+        if kind == "hybrid" and scored:
+            # ハイブリッド化の効果をその場で確認できるようにする
+            rf_only = np.mean([m["rf_fog_f1"] for m in scored])
+            xgb_only = np.mean([m["xgb_fog_f1"] for m in scored])
+            print(f"　平均霧F1の内訳 → RandomForest単独: {rf_only:.3f} / XGBoost単独: {xgb_only:.3f}"
+                  f" / ハイブリッド: {np.mean(fog_f1s):.3f}（{len(scored)}地点で比較）")
         print("※ 正解率は「/」（現象なし）が大多数だと高く出ます。霧の当たり具合は霧F1で確認してください。")
     else:
         print("\n【警告】どの地点も学習条件を満たさず、モデルを1つも作れませんでした。")
@@ -1761,7 +2035,7 @@ def export_prediction_csv(pred_df, prob_df, models, location_mapping, location_n
 
 def run_fog_prediction_addon(main_df, phenom_df, phenom_cols, location_name, out_dir, location_mapping,
                              lat: float = None, lon: float = None, forecast_days: int = None,
-                             history_days: int = 5):
+                             history_days: int = 5, model=DEFAULT_MODEL_KIND):
     """モデル学習 → 予報取得 → 地点ごとの予測グラフ・サマリー・CSV出力までを行う。"""
     lat = FORECAST_LAT if lat is None else lat
     lon = FORECAST_LON if lon is None else lon
@@ -1769,7 +2043,7 @@ def run_fog_prediction_addon(main_df, phenom_df, phenom_cols, location_name, out
 
     report_phenomena_quality(phenom_df, phenom_cols, location_mapping)
 
-    models = train_location_models(main_df, phenom_df, phenom_cols, location_mapping)
+    models = train_location_models(main_df, phenom_df, phenom_cols, location_mapping, model=model)
     if not models:
         print("\n【予測モデル】1地点も学習できなかったため、予測グラフの生成をスキップしました。")
         return []
@@ -1899,6 +2173,9 @@ def _parse_args(argv=None):
                         help="予報を取得する日数（Open-Meteoの上限は16）")
     parser.add_argument("--history-days", type=int, default=5,
                         help="④のグラフに表示する実測データの日数")
+    parser.add_argument("--model", choices=list(MODEL_KINDS), default=DEFAULT_MODEL_KIND,
+                        help="学習モデル（hybrid=RandomForest+XGBoostの加重平均 / "
+                             "rf=RandomForest単独＝従来と同じ速さ / xgb=XGBoost単独）")
     parser.add_argument("--no-forecast", action="store_true", help="霧予測（④⑤⑥）を行わない")
     parser.add_argument("--no-monthly", action="store_true", help="月別グラフ（①②）を作らない")
     parser.add_argument("--font", default=None,
@@ -1989,7 +2266,7 @@ def zip_outputs(out_dir, download: bool = False):
 def run(input_file=None, output_dir=None, sheet=None, layout="auto",
         lat=None, lon=None, forecast_days=None, history_days=5,
         forecast=True, monthly=True, font=None, show=None,
-        zip_output=False, download=False):
+        zip_output=False, download=False, model=DEFAULT_MODEL_KIND):
     """Colabのセルから直接呼べるエントリーポイント。
 
         from weather_visualizer import run
@@ -1997,6 +2274,8 @@ def run(input_file=None, output_dir=None, sheet=None, layout="auto",
 
     引数はコマンドラインのオプションと同じ意味。show=True でグラフをセル内に表示、
     zip_output=True で出力フォルダをZIPにまとめる（download=Trueでダウンロードまで）。
+    model="hybrid"（既定）はRandomForestとXGBoostのハイブリッド、"rf" / "xgb" で
+    片方だけを使う（"rf" は従来と同じ速さ）。
     """
     if font:
         setup_japanese_font(font_name=font)
@@ -2033,6 +2312,7 @@ def run(input_file=None, output_dir=None, sheet=None, layout="auto",
         generated += run_fog_prediction_addon(
             main_df, phenom_df, phenom_cols, location_name, out_dir, location_mapping,
             lat=lat, lon=lon, forecast_days=forecast_days, history_days=history_days,
+            model=model,
         )
     else:
         print("\n霧予測（④⑤⑥）の生成はスキップしました。")
@@ -2067,7 +2347,7 @@ def main(argv=None):
         run(input_file=args.input, output_dir=args.output, sheet=args.sheet, layout=args.layout,
             lat=args.lat, lon=args.lon, forecast_days=args.forecast_days,
             history_days=args.history_days, forecast=not args.no_forecast,
-            monthly=not args.no_monthly, zip_output=args.zip)
+            monthly=not args.no_monthly, zip_output=args.zip, model=args.model)
     except FileNotFoundError as e:
         print(f"【エラー】{e}")
         return 1

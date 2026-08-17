@@ -425,6 +425,100 @@ def _synthetic_observations(n_days=60):
     return main_df, phenom_df, ["AC", "AD"], {"AC": "地点甲", "AD": "地点乙"}
 
 
+class _StubModel:
+    """predict_proba が固定の確率を返すだけのダミーモデル（ブレンド計算の検証用）。"""
+
+    def __init__(self, classes, proba):
+        self.classes_ = np.array(classes)
+        self.proba = np.array(proba, dtype=float)
+
+    def predict_proba(self, X):
+        return self.proba
+
+
+class TestHybridFogClassifier(unittest.TestCase):
+    def setUp(self):
+        # クラスは 0（現象なし）と 2（川霧＝霧コード）の2つ
+        self.rf = _StubModel([0, 2], [[0.8, 0.2]])
+        self.xgb = _StubModel([0, 2], [[0.2, 0.8]])
+        self.X = np.zeros((1, 3))
+
+    def test_blend_is_weighted_average(self):
+        half = wv.HybridFogClassifier(self.rf, self.xgb, weight=0.5)
+        np.testing.assert_allclose(half.predict_proba(self.X), [[0.5, 0.5]])
+        rf_heavy = wv.HybridFogClassifier(self.rf, self.xgb, weight=0.75)
+        np.testing.assert_allclose(rf_heavy.predict_proba(self.X), [[0.65, 0.35]])
+
+    def test_weight_endpoints_are_single_models(self):
+        np.testing.assert_allclose(
+            wv.HybridFogClassifier(self.rf, self.xgb, weight=1.0).predict_proba(self.X),
+            self.rf.proba)
+        np.testing.assert_allclose(
+            wv.HybridFogClassifier(self.rf, self.xgb, weight=0.0).predict_proba(self.X),
+            self.xgb.proba)
+
+    def test_predict_returns_original_phenomenon_codes(self):
+        # XGB寄りにすると霧コード2が選ばれる
+        self.assertEqual(wv.HybridFogClassifier(self.rf, self.xgb, weight=0.0).predict(self.X)[0], 2)
+        self.assertEqual(wv.HybridFogClassifier(self.rf, self.xgb, weight=1.0).predict(self.X)[0], 0)
+
+    def test_single_model_types(self):
+        rf_only = wv.HybridFogClassifier(self.rf)
+        self.assertEqual(rf_only.model_type, "rf")
+        self.assertEqual(rf_only.weight, 1.0)
+        xgb_only = wv.HybridFogClassifier(None, self.xgb)
+        self.assertEqual(xgb_only.model_type, "xgb")
+        self.assertEqual(xgb_only.weight, 0.0)
+        with self.assertRaises(ValueError):
+            wv.HybridFogClassifier(None, None)
+
+    def test_classes_are_aligned_before_blending(self):
+        """片方に無いクラスがあっても、列がずれずに合成されること。"""
+        rf = _StubModel([0, 1, 2], [[0.5, 0.3, 0.2]])
+        xgb = _StubModel([0, 2], [[0.4, 0.6]])  # クラス1を知らない
+        blended = wv.HybridFogClassifier(rf, xgb, weight=0.5).predict_proba(self.X)
+        np.testing.assert_allclose(blended, [[0.45, 0.15, 0.40]])
+
+    def test_compute_fog_probability_works_with_hybrid(self):
+        hybrid = wv.HybridFogClassifier(self.rf, self.xgb, weight=0.5)
+        # クラス2は霧コードなので、霧確率は0.5になる
+        np.testing.assert_allclose(wv.compute_fog_probability(hybrid, self.X), [0.5])
+
+
+class TestModelKindResolution(unittest.TestCase):
+    def test_invalid_kind_raises(self):
+        with self.assertRaises(ValueError):
+            wv._resolve_model_kind("lightgbm")
+
+    def test_falls_back_to_rf_without_xgboost(self):
+        with mock.patch.object(wv, "_HAS_XGBOOST", False):
+            self.assertEqual(wv._resolve_model_kind("hybrid"), "rf")
+            self.assertEqual(wv._resolve_model_kind("xgb"), "rf")
+            self.assertEqual(wv._resolve_model_kind("rf"), "rf")
+
+    def test_default_is_hybrid(self):
+        self.assertEqual(wv.DEFAULT_MODEL_KIND, "hybrid")
+        with mock.patch.object(wv, "_HAS_XGBOOST", True):
+            self.assertEqual(wv._resolve_model_kind(None), "hybrid")
+
+
+@unittest.skipUnless(wv._HAS_XGBOOST, "xgboost が導入されていない環境ではスキップ")
+class TestXGBLabelSafeClassifier(unittest.TestCase):
+    def test_handles_non_contiguous_labels(self):
+        """現象コードが {0, 2, 7} のように歯抜けでも学習・予測できること。"""
+        rng = np.random.default_rng(0)
+        X = pd.DataFrame({"a": rng.normal(size=120), "b": rng.normal(size=120)})
+        y = pd.Series(np.tile([0, 2, 7], 40))
+        X["a"] = y.map({0: 0.0, 2: 5.0, 7: 10.0}) + rng.normal(0, 0.1, 120)  # 分離しやすくする
+
+        clf = wv._XGBLabelSafeClassifier(n_estimators=20, max_depth=3).fit(X, y)
+        self.assertEqual(list(clf.classes_), [0, 2, 7])
+        pred = clf.predict(X)
+        self.assertTrue(set(np.unique(pred)).issubset({0, 2, 7}))
+        self.assertGreater((pred == y.to_numpy()).mean(), 0.9)
+        self.assertEqual(clf.predict_proba(X).shape, (120, 3))
+
+
 class TestTrainingAndPlots(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -471,6 +565,37 @@ class TestTrainingAndPlots(unittest.TestCase):
         self.assertTrue(made)
         for p in made:
             self.assertTrue(os.path.isfile(p))
+
+    def test_model_kind_switch(self):
+        """--model の指定どおりのモデルが使われること（小さめのデータで確認）。"""
+        main_df, phenom_df, _, _ = _synthetic_observations(n_days=20)
+        args = (main_df, phenom_df, ["AC"], {"AC": "地点甲"})
+
+        rf_only = wv.train_location_models(*args, model="rf")
+        self.assertEqual(rf_only["AC"]["model_type"], "rf")
+        self.assertGreater(rf_only["AC"]["accuracy"], 0.8)
+        self.assertGreater(rf_only["AC"]["fog_f1"], 0.5)
+
+        # xgboostが無い環境では hybrid 指定でも落ちずに rf へ降格する
+        with mock.patch.object(wv, "_HAS_XGBOOST", False):
+            fallback = wv.train_location_models(*args, model="hybrid")
+        self.assertEqual(fallback["AC"]["model_type"], "rf")
+
+    @unittest.skipUnless(wv._HAS_XGBOOST, "xgboost が導入されていない環境ではスキップ")
+    def test_hybrid_training(self):
+        main_df, phenom_df, _, _ = _synthetic_observations(n_days=20)
+        models = wv.train_location_models(main_df, phenom_df, ["AC"], {"AC": "地点甲"},
+                                          model="hybrid")
+        info = models["AC"]
+        self.assertEqual(info["model_type"], "hybrid")
+        self.assertIn(info["blend_weight"], wv.BLEND_WEIGHTS)
+        self.assertGreater(info["fog_f1"], 0.5)
+        # 混ぜる前の単独モデルの成績も記録されていること（効果の確認用）
+        self.assertFalse(np.isnan(info["rf_fog_f1"]))
+        self.assertFalse(np.isnan(info["xgb_fog_f1"]))
+        # ハイブリッドは単独モデルの良い方から大きく劣化しないこと
+        self.assertGreaterEqual(info["fog_f1"],
+                                min(info["rf_fog_f1"], info["xgb_fog_f1"]) - 0.05)
 
     def test_forecast_with_missing_feature_does_not_crash(self):
         """予報側に欠測が残っていてもpredictが例外にならないこと。"""
