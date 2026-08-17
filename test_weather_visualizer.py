@@ -17,6 +17,7 @@ from unittest import mock
 os.environ.setdefault("WEATHER_VIZ_QUIET", "1")
 os.environ.setdefault("WEATHER_VIZ_NO_FONT_INSTALL", "1")
 
+import matplotlib
 import numpy as np
 import pandas as pd
 
@@ -114,6 +115,130 @@ class TestEncoding(unittest.TestCase):
         # 静穏は sin=cos=0（欠測として行が落ちないこと）
         self.assertEqual(out["風向_sin"].iloc[1], 0.0)
         self.assertEqual(out["風向_cos"].iloc[1], 0.0)
+
+
+# ---------------------------------------------------------------------------
+# 日本語フォント（グラフの文字化け対策）
+# ---------------------------------------------------------------------------
+
+class _FakeFontEntry:
+    def __init__(self, name, fname):
+        self.name = name
+        self.fname = fname
+
+
+class TestJapaneseFont(unittest.TestCase):
+    def setUp(self):
+        self._rc = dict(matplotlib.rcParams)
+
+    def tearDown(self):
+        matplotlib.rcParams.update(self._rc)
+
+    def test_dejavu_is_detected_as_unusable_for_japanese(self):
+        """名前だけでなく実際のグリフで判定できること（豆腐文字の検出）。"""
+        import matplotlib.font_manager as fm
+        dejavu = fm.findfont(fm.FontProperties(family="DejaVu Sans"))
+        self.assertFalse(wv._font_file_supports_japanese(dejavu))
+
+    def test_placeholder_fonts_are_rejected(self):
+        """Last Resort は全文字のグリフを持つが中身は□なので選んではいけない。"""
+        self.assertTrue(wv._is_placeholder_font("Last Resort High-Efficiency", "/x/LastResortHE.ttf"))
+        self.assertTrue(wv._is_placeholder_font(
+            "DejaVu Sans", "/usr/lib/python3/matplotlib/mpl-data/fonts/ttf/DejaVuSans.ttf"))
+        self.assertFalse(wv._is_placeholder_font("IPAexGothic", "/usr/share/fonts/ipaexg.ttf"))
+
+    def test_find_cjk_font_skips_placeholder_fonts(self):
+        import matplotlib.font_manager as fm
+        last_resort = os.path.join(matplotlib.get_data_path(), "fonts", "ttf",
+                                   "LastResortHE-Regular.ttf")
+        if not os.path.isfile(last_resort):
+            self.skipTest("Last Resort フォントが同梱されていません")
+        # Last Resort だけを登録した状態では「日本語フォントなし」と判定されるべき
+        with mock.patch.object(wv.fm.fontManager, "ttflist",
+                               [_FakeFontEntry("Last Resort High-Efficiency", last_resort)]):
+            name, _ = wv._find_cjk_font()
+        self.assertIsNone(name)
+
+    def test_ttc_font_is_verified(self):
+        """.ttc（複数書体をまとめたファイル）でもグリフ判定ができること。"""
+        import matplotlib.font_manager as fm
+        ttcs = [f.fname for f in fm.fontManager.ttflist
+                if str(f.fname).lower().endswith((".ttc", ".otc"))]
+        if not ttcs:
+            self.skipTest(".ttc フォントがない環境です")
+        results = [wv._font_file_supports_japanese(p) for p in ttcs[:10]]
+        self.assertTrue(any(r is not None for r in results),
+                        "すべて判定不能＝.ttcの読み込みに失敗している")
+
+    def test_apply_font_keeps_other_fonts_as_fallback(self):
+        wv._apply_font("TestFont")
+        self.assertEqual(matplotlib.rcParams["font.family"], ["sans-serif"])
+        self.assertEqual(matplotlib.rcParams["font.sans-serif"][0], "TestFont")
+        self.assertIn("DejaVu Sans", matplotlib.rcParams["font.sans-serif"])
+        self.assertFalse(matplotlib.rcParams["axes.unicode_minus"])
+
+    def test_apply_font_does_not_duplicate(self):
+        wv._apply_font("TestFont")
+        wv._apply_font("TestFont")
+        self.assertEqual(matplotlib.rcParams["font.sans-serif"].count("TestFont"), 1)
+
+    def test_find_cjk_font_ignores_fonts_without_japanese_glyphs(self):
+        """名前に日本語フォントらしさが無くても、グリフがあれば拾えること。"""
+        import matplotlib.font_manager as fm
+        dejavu = fm.findfont(fm.FontProperties(family="DejaVu Sans"))
+        real = fm.findfont(fm.FontProperties(family=fm.FontProperties().get_family()))
+        fake_list = [_FakeFontEntry("DejaVu Sans", str(dejavu)),
+                     _FakeFontEntry("謎のフォント", str(real))]
+        with mock.patch.object(wv.fm.fontManager, "ttflist", fake_list):
+            name, path = wv._find_cjk_font()
+        # この環境に日本語フォントがあれば拾え、無ければ何も返さない
+        if name is not None:
+            self.assertNotEqual(name, "DejaVu Sans")
+
+    def test_install_is_attempted_when_no_font_found(self):
+        """フォントが無い環境（Colab等）でインストールが試みられること。"""
+        calls = []
+
+        def fake_run(cmd, timeout):
+            calls.append(cmd)
+            return False, "E: Unable to locate package"
+
+        with mock.patch.object(wv, "_find_cjk_font", lambda *a, **k: (None, None)), \
+             mock.patch.object(wv, "_register_font_files", lambda *a, **k: 0), \
+             mock.patch.object(wv, "_run_command", fake_run), \
+             mock.patch.object(wv.sys, "platform", "linux"):
+            name, path = wv._install_japanese_font(verbose=False)
+
+        self.assertIsNone(name)
+        joined = [" ".join(c) for c in calls]
+        self.assertTrue(any("fonts-ipafont-gothic" in c for c in joined), joined)
+        self.assertTrue(any("fonts-noto-cjk" in c for c in joined), joined)
+        self.assertTrue(any("japanize-matplotlib" in c for c in joined), joined)
+        self.assertTrue(any("apt-get update" in c for c in joined), joined)
+
+    def test_install_is_skipped_when_disabled(self):
+        with mock.patch.object(wv, "_find_cjk_font", lambda *a, **k: (None, None)), \
+             mock.patch.object(wv, "_register_font_files", lambda *a, **k: 0), \
+             mock.patch.object(wv, "_install_japanese_font") as installer:
+            wv.setup_japanese_font(verbose=False, allow_install=False)
+        installer.assert_not_called()
+
+    def test_setup_reports_failure_instead_of_pretending(self):
+        """フォントを設定できない場合はNoneを返すこと（成功したふりをしない）。"""
+        with mock.patch.object(wv, "_find_cjk_font", lambda *a, **k: (None, None)), \
+             mock.patch.object(wv, "_register_font_files", lambda *a, **k: 0), \
+             mock.patch.object(wv, "verify_japanese_font",
+                               lambda: (False, "DejaVu Sans", "/x/DejaVuSans.ttf")):
+            result = wv.setup_japanese_font(verbose=False, allow_install=False)
+        self.assertIsNone(result)
+
+    def test_font_check_image_is_created(self):
+        tmpdir = tempfile.mkdtemp(prefix="wv_font_")
+        try:
+            path = wv.plot_font_check(tmpdir)
+            self.assertTrue(os.path.isfile(path))
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -373,6 +498,11 @@ class TestArgParsing(unittest.TestCase):
         self.assertEqual(args.input, "データ.xlsx")
         self.assertEqual(args.output, "出力先")
 
+    def test_single_non_data_argument_is_the_output_dir(self):
+        args = wv._parse_args(["--check-font", "出力先"])
+        self.assertEqual(args.output, "出力先")
+        self.assertEqual(args.input, wv.DEFAULT_INPUT_FILE)
+
     def test_defaults(self):
         args = wv._parse_args([])
         self.assertEqual(args.input, wv.DEFAULT_INPUT_FILE)
@@ -442,6 +572,46 @@ class TestMainEndToEnd(unittest.TestCase):
 
     def test_main_returns_error_for_missing_file(self):
         self.assertEqual(wv.main(["存在しないファイル.xlsx", "/tmp/なんとか"]), 1)
+
+
+# ---------------------------------------------------------------------------
+# Colab向けのエントリーポイント run()
+# ---------------------------------------------------------------------------
+
+@unittest.skipUnless(os.path.isfile("data.csv"), "data.csv がありません")
+class TestRunApi(unittest.TestCase):
+    def test_run_generates_files(self):
+        tmpdir = tempfile.mkdtemp(prefix="wv_run_")
+        try:
+            with mock.patch.object(wv.requests, "get",
+                                   lambda *a, **k: _FakeResponse(_fake_forecast_payload(48))):
+                made = wv.run("data.csv", tmpdir, monthly=False, show=False)
+            self.assertTrue(made)
+            for p in made:
+                self.assertTrue(os.path.isfile(p), p)
+            self.assertTrue(any(str(p).endswith(".csv") for p in made))
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_run_raises_clear_error_for_missing_file(self):
+        with self.assertRaises(FileNotFoundError) as ctx:
+            wv.run("存在しないファイル.xlsx", "/tmp/なんとか")
+        self.assertIn("入力ファイルが見つかりません", str(ctx.exception))
+
+    def test_zip_outputs(self):
+        tmpdir = tempfile.mkdtemp(prefix="wv_zip_")
+        try:
+            out_dir = os.path.join(tmpdir, "out")
+            os.makedirs(out_dir)
+            with open(os.path.join(out_dir, "dummy.txt"), "w") as f:
+                f.write("x")
+            zip_path = wv.zip_outputs(out_dir)
+            self.assertTrue(os.path.isfile(zip_path))
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_display_is_noop_outside_notebook(self):
+        self.assertEqual(wv.display_in_notebook(["a.png"]), [])
 
 
 if __name__ == "__main__":

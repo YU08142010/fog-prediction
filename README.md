@@ -1,70 +1,143 @@
 # 只見川 川霧 観測・予測プログラム（weather_visualizer.py）
 
+**Google Colab で動かすことを前提にしたプログラムです。**
+
 只見川流域の気象データ（気象庁ダウンロード形式の Excel / CSV）を読み込み、
 
 1. **気温・湿度・風速・降水量などの気象データ**と、
 2. **各地点の川霧・層雲・霧雨などの現象コード**
 
-を月ごとにグラフ化し、さらに **scikit-learn（RandomForestClassifier）で地点ごとに霧の発生を学習** して、
-**Open-Meteo API から取得した今後16日間の気象予報**をもとに、地点ごとの霧予測グラフとCSVまで自動生成するツールです。
+を月ごとにグラフ化し、さらに **scikit-learn（RandomForestClassifier）で地点ごとに霧の発生を学習**して、
+**Open-Meteo API から取得した今後16日間の気象予報**をもとに、地点ごとの霧予測グラフとCSVまで自動生成します。
 
 ---
 
-## できること
+## Colabでの使い方（コピーして貼るだけ）
 
-- 月ごとの気象データ×現象コードのグラフ生成（全地点ぶんの現象レーンつき）
-- **列レイアウトの自動検出**（見出しの文字から日時・気温・降水量・風速・風向・露点・湿度・地点列を判定。`--layout fixed` で従来の固定列にも戻せます）
-- **どのファイルのどの列から何を読んだか**を実行時に一覧表示（データの出どころの確認用）
-- **地点ごとの記録状況レポート**（「/」＝現象なし・現象あり・未入力の件数、最終記録日）
-- 「/」がほぼ皆無で不自然なブロック（テスト用ダミーデータの疑いがある期間）を自動検出し、学習データから除外
-- 地点それぞれについて独立した RandomForestClassifier を学習（多クラス分類：「/」＋コード1〜10）
-- `RandomizedSearchCV` による地点ごとのハイパーパラメータ自動調整（サンプルが少ない地点は既定値に自動フォールバック）
-- Open-Meteo の無料予報APIから今後16日分の気象予報を取得し、学習済みモデルで地点ごとに現象コードと**霧の発生確率**を予測
-- 予測結果を地点ごとのグラフとして出力（実測と予報が離れている場合は横軸を分割して読みやすく表示）
-- 全地点の予測をまとめた「日別霧予測サマリー」グラフ
-- 予測結果のCSV出力（Excelでそのまま開けるBOM付きUTF-8）
+### 1. プログラムを取ってくる
 
----
-
-## 必要な環境・ライブラリ
-
-```bash
-pip install -r requirements.txt      # pandas numpy matplotlib openpyxl scikit-learn requests
+```python
+!git clone https://github.com/YU08142010/fog-prediction.git
+%cd fog-prediction
 ```
 
-インターネット接続が必要です（Open-Meteoへの予報取得のため）。日本語フォントが無い環境（Colab等）では、
-初回実行時に `fonts-noto-cjk` の自動インストールを試みます（Linuxのみ）。
+（2回目以降は `%cd fog-prediction` と `!git pull` だけでOKです）
 
----
+### 2. データを用意する
 
-## 使い方
+次のどちらでも構いません。
+
+- **左のファイル一覧にドラッグ＆ドロップ**する（例: `/content/只見_気象データ.xlsx`）
+- **Googleドライブをマウント**して、ドライブ上のファイルを指定する
+
+```python
+from google.colab import drive
+drive.mount('/content/drive')
+```
+
+### 3. 実行する
+
+```python
+from weather_visualizer import run
+
+run("/content/drive/MyDrive/只見_気象データ.xlsx")
+```
+
+- グラフは `./output_graphs` に保存され、**Colabのセル内にも表示されます**。
+- 日本語フォントが無い場合は、初回実行時に自動でインストールします（下の「文字化けする場合」参照）。
+- 追加ライブラリのインストールは基本的に不要です（Colabに最初から入っています）。
+
+### 4. 結果を手元に持ち帰る（任意）
+
+```python
+run("/content/只見_気象データ.xlsx", zip_output=True, download=True)
+```
+
+出力フォルダをZIPにまとめてダウンロードします。
+
+### `run()` に指定できるもの
+
+```python
+run(
+    "/content/只見_気象データ.xlsx",   # 入力ファイル（.xlsx / .xlsm / .csv）
+    "output_graphs",                  # 出力フォルダ
+    sheet=None,          # Excelのシート名（省略時は先頭シート）
+    layout="auto",       # 列の決め方（"auto"=見出しから自動検出 / "fixed"=従来の固定列）
+    lat=37.3486,         # 予報を取得する地点の緯度（既定＝只見町付近）
+    lon=139.3122,        # 　　　　〃　　　　　　経度
+    forecast_days=16,    # 予報日数（Open-Meteoの上限は16）
+    history_days=5,      # ④のグラフに表示する実測データの日数
+    forecast=True,       # False にすると霧予測（④⑤⑥）を作らない
+    monthly=True,        # False にすると月別グラフ（①②）を作らない
+    font=None,           # 使う日本語フォント名（例: "IPAexGothic"）
+    show=None,           # セル内にグラフを表示するか（既定: ノートブックなら表示）
+    zip_output=False,    # 出力フォルダをZIPにまとめる
+    download=False,      # ZIPをそのままダウンロードする
+)
+```
+
+### コマンドとして実行することもできます
 
 ```bash
-python3 weather_visualizer.py 入力ファイル.xlsx [出力フォルダ] [オプション]
-python3 weather_visualizer.py --help          # オプション一覧
+!python weather_visualizer.py 入力ファイル.xlsx [出力フォルダ] [オプション]
+!python weather_visualizer.py --help
 ```
 
 | オプション | 意味 | 既定値 |
 |---|---|---|
 | `--sheet 名前` | 読み込むExcelのシート名 | 先頭シート |
-| `--layout auto\|fixed` | 列の決め方（auto=見出しから自動検出、fixed=従来の固定列） | `auto` |
+| `--layout auto\|fixed` | 列の決め方 | `auto` |
 | `--lat` / `--lon` | 予報を取得する地点の緯度・経度 | 37.3486 / 139.3122（只見町付近） |
-| `--forecast-days N` | 予報を取得する日数（Open-Meteoの上限は16） | 16 |
-| `--history-days N` | ④のグラフに表示する実測データの日数 | 5 |
-| `--no-forecast` | 霧予測（④⑤⑥）を行わない | - |
+| `--forecast-days N` | 予報を取得する日数（上限16） | 16 |
+| `--history-days N` | ④に表示する実測データの日数 | 5 |
+| `--no-forecast` | 霧予測（④⑤⑥）を作らない | - |
 | `--no-monthly` | 月別グラフ（①②）を作らない | - |
+| `--font 名前` | グラフに使う日本語フォント名 | 自動 |
+| `--check-font` | 日本語フォントの確認だけ行う | - |
+| `--zip` | 出力フォルダをZIPにまとめる | - |
 
-- 入力は `.xlsx` / `.xlsm` / `.csv` に対応しています（CSVは UTF-8 / BOM付き / Shift_JIS を自動判別）。
-- 出力フォルダを省略した場合は `./output_graphs` に保存されます。
-- 入力ファイルと出力フォルダはどちらの順で書いても構いません。
-- Jupyter / Google Colab のセルにそのまま貼り付けて実行することもできます。
-  - ノートブック環境ではコマンドライン引数を読まず、`DEFAULT_INPUT_FILE` / `DEFAULT_OUTPUT_DIR` を使います。
-  - 入力ファイルが見つからない場合、Colabなら自動でアップロード画面が表示されます。
+---
 
-### 動作確認（テスト）
+## グラフの日本語が □（豆腐文字）になる場合
+
+Colabの初期状態には日本語フォントが入っていません。本プログラムは起動時に
+
+1. すでに入っている日本語フォントを探す（**名前だけでなく、実際に「霧」などの字を持っているかまで確認します**）
+2. 無ければ `apt-get install -y fonts-ipafont-gothic`
+3. それも駄目なら `apt-get install -y fonts-noto-cjk`
+4. それも駄目なら `pip install japanize-matplotlib`
+
+の順に自動で導入を試みます。最後に「matplotlibが実際に使うフォント」を調べ、
+日本語が描けない場合は警告と対処方法を表示します。
+
+### それでも駄目なとき
+
+```python
+# 確認だけする（font_check.png が出力され、セルにも表示されます）
+!python weather_visualizer.py --check-font
+```
+
+```python
+# 手動でフォントを入れる
+!apt-get -y install fonts-ipafont-gothic
+# または
+!pip install japanize-matplotlib
+```
+
+```python
+# フォントを名前で直接指定する
+run("データ.xlsx", font="IPAexGothic")
+```
+
+インストール後は**ランタイムの再起動は不要**です。そのまま実行し直せば反映されます。
+（`WEATHER_VIZ_FONT` 環境変数でも指定できます。`WEATHER_VIZ_NO_FONT_INSTALL=1` で自動インストールを止められます）
+
+---
+
+## 動作確認（テスト）
 
 ```bash
-python3 -m unittest -v test_weather_visualizer
+!python -m unittest -v test_weather_visualizer
 ```
 
 ネットワークには接続しません（Open-Meteoへの通信はダミーに差し替えています）。
@@ -73,7 +146,7 @@ python3 -m unittest -v test_weather_visualizer
 
 ## 入力データのフォーマット
 
-気象庁からダウンロードした形式を想定しています。既定（`--layout auto`）では、
+気象庁からダウンロードした形式を想定しています。既定（`layout="auto"`）では、
 見出し行の文字から次の列を自動的に探します。
 
 | 探すもの | 見出しに含まれる文字 |
@@ -88,7 +161,7 @@ python3 -m unittest -v test_weather_visualizer
 | 観測地点（現象コード列） | 気象要素より右にあり、名前が付いている列 |
 
 「品質情報」「均質番号」「現象なし情報」などの補助列は観測地点とみなしません。
-自動検出がうまくいかない場合は `--layout fixed` を指定すると、従来どおりの固定列
+自動検出がうまくいかない場合は `layout="fixed"` を指定すると、従来どおりの固定列
 （A=日時, B=気温, E=降水量, H=風速, S=露点温度, V=相対湿度, AC〜BH=現象コード32地点, 3行目=地点名）で読み込みます。
 
 見つからなかった気象要素は欠測（NaN）として扱い、実行時に警告を表示します。
@@ -132,8 +205,6 @@ python3 -m unittest -v test_weather_visualizer
 
 ### ①②：気象データ × 現象コード（月別・全地点まとめ）
 
-月ごとに以下の2種類を生成します。
-
 - `{地点名}_①気温・湿度・露点×現象コード_YYYY-MM.png`
 - `{地点名}_②風速・降水量×現象コード_YYYY-MM.png`
 
@@ -141,8 +212,6 @@ python3 -m unittest -v test_weather_visualizer
 色分けした帯（レーン）で表示します。横軸の日付は `年/月/日` 形式です。
 
 ### ④：地点ごとの16日間予測グラフ
-
-学習済みモデルで予測できた地点それぞれについて生成します。
 
 - `{地点名}_④{観測地点名}_16日間予測_YYYYMMDD.png`
 
@@ -194,13 +263,27 @@ python3 -m unittest -v test_weather_visualizer
 
 ---
 
+## 実行時に表示される確認情報
+
+「Excelから読めているのか」「Open-Meteoから取れているのか」を毎回確認できるようにしています。
+
+- 読み込んだファイルの**絶対パス・見出し行・どの列から何を読んだか・有効値の件数・期間**
+- **検出した観測地点の一覧**（列 → 地点名）
+- 地点ごとの**記録状況**（「/」＝現象なし・現象あり・未入力の件数、最終記録日）
+- 日時として解釈できず除外した行の件数と実例
+- Open-Meteoの**取得URL・緯度経度・件数・期間・先頭3行**
+
+---
+
 ## 既知の制限・注意点
 
-- **予報地点は1点**：`--lat` / `--lon` で指定した1地点の予報を全地点の予測に使っています。
+- **Google Colab 前提**：ローカルのPCでも動きますが、日本語フォントの自動導入や
+  ファイルのアップロード／ダウンロード支援はColabに合わせて作っています。
+- **予報地点は1点**：`lat` / `lon` で指定した1地点の予報を全地点の予測に使っています。
   既定値は只見町付近（37.3486, 139.3122）です。観測地点ごとの正確な座標が分かる場合は、
   地点ごとに予報を取得するよう拡張すると精度が上がります。
 - **「/」の記録がない地点**：現象があった時刻だけを記入している地点は「現象なし」の例を学習できないため、
-  予測が現象側に偏ります（実行時に警告を表示します）。学習にはダミー判定で除外されることもあります。
+  予測が現象側に偏ります（実行時に警告を表示します）。
 - **季節性の偏り**：只見川の川霧は主に6〜9月の早朝・夕方に発生しやすいため、その季節を含まないデータ期間では
   霧サンプルがほぼゼロになり、学習できない地点が出てきます。
 - **観測記録と予報のあいだの空白**：現象コードの入力が気象データ本体より遅れていることがあります。
@@ -214,6 +297,8 @@ python3 -m unittest -v test_weather_visualizer
 
 | 関数 | 役割 |
 |---|---|
+| `run()` | Colabのセルから呼ぶエントリーポイント（読み込み〜グラフ〜予測〜表示） |
+| `setup_japanese_font()` / `verify_japanese_font()` | 日本語フォントの自動設定と、実際に日本語が描けるかの検証 |
 | `load_weather_data()` | Excel/CSVを読み込み、気象データ(main_df)・現象コード(phenom_df)・地点名一覧を作る |
 | `read_grid()` / `find_header_row()` / `detect_layout()` | ファイルを2次元配列として読み、見出し行と列の役割を判定する |
 | `parse_datetime_value()` / `parse_datetime_series()` | 「2024年6月28日24時」などの日時表記を解釈する（24時＝翌日0時、年の省略にも対応） |
@@ -229,7 +314,7 @@ python3 -m unittest -v test_weather_visualizer
 | `plot_single_location_forecast()` | ④の地点別予測グラフを1地点ぶん描画 |
 | `plot_all_location_summary()` | ⑤の全地点サマリーグラフを描画 |
 | `export_prediction_csv()` | ⑥の予測結果CSVを出力 |
-| `run_fog_prediction_addon()` | 学習〜予測〜出力を一通り実行するエントリーポイント |
+| `display_in_notebook()` / `zip_outputs()` | Colabのセルへの表示と、出力のZIP化・ダウンロード |
 
 ---
 

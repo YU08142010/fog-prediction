@@ -23,13 +23,20 @@
   ⑤   日別霧予測サマリー（全地点まとめ）
   ⑥   予測結果CSV（地点ごとの予測コードと霧確率）
 
-使い方:
-    python3 weather_visualizer.py 入力ファイル.xlsx [出力フォルダ] [オプション]
-    python3 weather_visualizer.py --help   でオプション一覧
+使い方（Google Colab を想定しています）:
 
-Jupyter / Google Colab でセルに貼って実行する場合は、下の
-DEFAULT_INPUT_FILE / DEFAULT_OUTPUT_DIR を編集してください
-（ノートブック環境ではコマンドライン引数は読みません）。
+    # ① このファイルを置いたフォルダで
+    from weather_visualizer import run
+    run("/content/drive/MyDrive/只見_気象データ.xlsx")
+
+    # ② コマンドとして実行する場合
+    !python weather_visualizer.py 入力ファイル.xlsx [出力フォルダ] [オプション]
+    !python weather_visualizer.py --help          # オプション一覧
+    !python weather_visualizer.py --check-font    # 日本語の文字化け確認だけ行う
+
+日本語フォントが無い環境（Colabの初期状態）では、初回実行時に
+IPAゴシック → Noto Sans CJK → japanize-matplotlib の順に自動導入を試み、
+最後に「本当に日本語が描けるか」をフォントのグリフまで確認します。
 """
 
 from __future__ import annotations
@@ -38,6 +45,7 @@ import argparse
 import glob
 import os
 import re
+import shutil
 import subprocess
 import sys
 import unicodedata
@@ -68,57 +76,293 @@ from sklearn.metrics import accuracy_score, f1_score
 # ===========================================================================
 
 _CJK_FONT_KEYWORDS = [
-    "noto sans cjk", "noto serif cjk", "ipaex", "ipagothic", "ipa gothic",
-    "takao", "vl gothic", "yu gothic", "ms gothic", "hiragino",
-    "source han sans", "droid sans fallback",
+    "noto sans cjk", "noto serif cjk", "noto sans jp", "notosansjp",
+    "ipaex", "ipagothic", "ipa gothic", "ipapgothic", "ipamincho",
+    "takao", "vl gothic", "vl pgothic", "yu gothic", "ms gothic", "ms mincho",
+    "meiryo", "hiragino", "source han sans", "source han serif",
+    "droid sans fallback", "kozuka", "sazanami", "migmix", "mplus", "m+",
+    "unifont", "japanize",
 ]
 
+# このプログラムのグラフに実際に出てくる日本語。フォントがこれらの字を持っているかで
+# 「本当に日本語を描けるフォントか」を判定する（名前だけで判断すると豆腐文字になる）。
+_JP_TEST_TEXT = "霧気温露点湿度風速地点予測"
 
-def _find_cjk_font():
-    for f in fm.fontManager.ttflist:
-        if any(k in f.name.lower() for k in _CJK_FONT_KEYWORDS):
-            return f.name
-    return None
+# 探しにいくフォントの置き場所（Colab/Ubuntu、ユーザーローカル、macOS、Windows）
+_FONT_SEARCH_DIRS = [
+    "/usr/share/fonts", "/usr/local/share/fonts", os.path.expanduser("~/.fonts"),
+    os.path.expanduser("~/.local/share/fonts"), "/Library/Fonts",
+    os.path.expanduser("~/Library/Fonts"), "C:/Windows/Fonts",
+]
+_FONT_FILE_PATTERN = "**/*.[ot]t[fc]"
 
 
-def _install_noto_cjk_font():
-    # apt-getがあるLinux（Colab等）でのみ試みる。macOS/Windowsでは何もしない。
-    if not sys.platform.startswith("linux"):
-        return False
-    if os.environ.get("WEATHER_VIZ_NO_FONT_INSTALL"):
-        return False
+def _font_file_supports_japanese(path):
+    """フォントファイルが日本語のグリフを持っているか調べる。
+
+    戻り値: True=描ける / False=描けない（豆腐文字になる） / None=判定できなかった
+    matplotlibはfontToolsに依存しているので、追加インストールなしで判定できる。
+    """
+    if not path or not os.path.isfile(str(path)):
+        return None
     try:
-        subprocess.run(["apt-get", "update"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       timeout=120, check=False)
-        result = subprocess.run(
-            ["apt-get", "install", "-y", "fonts-noto-cjk"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300, check=False,
-        )
-        return result.returncode == 0
+        from fontTools.ttLib import TTFont
+    except Exception:
+        return None
+    try:
+        # .ttc/.otc は複数書体をまとめたファイルなので、どの書体かを指定して開く
+        # （matplotlibのfindfontはフォント内の番号つきで返してくることがある。
+        #   ただしパスがただの文字列の場合、str.index はメソッドなので採用しない）
+        kwargs = {}
+        if str(path).lower().endswith((".ttc", ".otc")):
+            raw_index = getattr(path, "index", None)
+            kwargs["fontNumber"] = raw_index if isinstance(raw_index, int) else 0
+        with TTFont(str(path), lazy=True, **kwargs) as font:
+            cmap = font.getBestCmap()
+    except Exception:
+        return None
+    return all(ord(ch) in cmap for ch in _JP_TEST_TEXT)
+
+
+def _is_placeholder_font(name, path):
+    """『すべての文字を持っているが、実際には□などの代替表示しかできない』フォントか。
+
+    matplotlibに同梱されている Last Resort は全コードポイントに字形を持つため、
+    グリフの有無だけで判定すると日本語フォントとして選ばれてしまい、
+    結局グラフが□だらけになる。こうしたフォントは候補から除外する。
+    """
+    lowered = name.lower()
+    if any(k in lowered for k in ("last resort", "adobe blank", "noto sans symbols")):
+        return True
+    # matplotlib同梱のフォント（DejaVu・STIX・Computer Modern）に日本語は入っていない
+    return "mpl-data" in str(path).replace("\\", "/")
+
+
+def _find_cjk_font(deep_scan=True):
+    """日本語が描けるフォントを探して (フォント名, ファイルパス) を返す。
+
+    1) 名前が日本語フォントらしいものを優先し、実際に日本語グリフがあるか確認する
+    2) 見つからなければ、登録されている全フォントのグリフを順に確認する
+       （名前が独特な日本語フォントでも拾えるようにするため）
+    """
+    named, others = [], []
+    for f in fm.fontManager.ttflist:
+        entry = (f.name, f.fname)
+        if _is_placeholder_font(f.name, f.fname):
+            continue
+        if any(k in f.name.lower() for k in _CJK_FONT_KEYWORDS):
+            named.append(entry)
+        else:
+            others.append(entry)
+
+    unverified = None
+    for name, path in named:
+        supported = _font_file_supports_japanese(path)
+        if supported:
+            return name, path
+        if supported is None and unverified is None:
+            unverified = (name, path)  # 判定できない場合は候補として保留
+
+    if deep_scan:
+        seen = set()
+        for name, path in others:
+            if path in seen:
+                continue
+            seen.add(path)
+            if _font_file_supports_japanese(path):
+                return name, path
+
+    return unverified if unverified else (None, None)
+
+
+def _register_font_files(verbose=False):
+    """フォントの置き場所を走査して、matplotlibに未登録のフォントを登録する。"""
+    known = {f.fname for f in fm.fontManager.ttflist}
+    added = 0
+    for directory in _FONT_SEARCH_DIRS:
+        if not os.path.isdir(directory):
+            continue
+        for path in glob.glob(os.path.join(directory, _FONT_FILE_PATTERN), recursive=True):
+            if path in known:
+                continue
+            try:
+                fm.fontManager.addfont(path)
+                added += 1
+            except Exception:
+                pass
+    if added and verbose:
+        print(f"  フォントを{added}件登録しました。")
+    return added
+
+
+def _rebuild_font_manager():
+    """matplotlibのフォント一覧をキャッシュを使わずに作り直す（最後の手段）。"""
+    try:
+        fm.fontManager = fm._load_fontmanager(try_read_cache=False)
+        return True
     except Exception:
         return False
 
 
-def setup_japanese_font(verbose: bool = True):
-    font_name = _find_cjk_font()
-    if font_name is None:
+def _run_command(cmd, timeout):
+    """コマンドを実行し、(成功したか, 出力の末尾) を返す。"""
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                timeout=timeout, check=False, text=True, errors="replace")
+        return result.returncode == 0, (result.stdout or "").strip()[-400:]
+    except FileNotFoundError:
+        return False, f"{cmd[0]} が見つかりません"
+    except subprocess.TimeoutExpired:
+        return False, f"{' '.join(cmd[:3])} がタイムアウトしました"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _install_japanese_font(verbose=True):
+    """日本語フォントの導入を順番に試す（Colabのような環境向け）。
+
+    軽くて速いものから試す:
+      1. apt-get install fonts-ipafont-gothic （数MB・数十秒）
+      2. apt-get install fonts-noto-cjk       （大きいが確実）
+      3. pip install japanize-matplotlib      （aptが使えない環境向け）
+    """
+    attempts = []
+    if sys.platform.startswith("linux"):
+        attempts += [
+            (["apt-get", "install", "-y", "fonts-ipafont-gothic"], 300, "IPAゴシック"),
+            (["apt-get", "install", "-y", "fonts-noto-cjk"], 600, "Noto Sans CJK"),
+        ]
+    attempts.append(([sys.executable, "-m", "pip", "install", "-q", "japanize-matplotlib"],
+                     300, "japanize-matplotlib"))
+
+    apt_updated = False
+    for cmd, timeout, label in attempts:
         if verbose:
-            print("日本語フォントが見つからないため、自動インストールを試みます…")
-        if _install_noto_cjk_font():
-            for fp in glob.glob("/usr/share/fonts/**/*.[ot]t[fc]", recursive=True):
+            print(f"  {label} の導入を試みます…（数十秒かかることがあります）")
+            print(f"    $ {' '.join(cmd)}")
+        ok, output = _run_command(cmd, timeout)
+        if not ok and cmd[0] == "apt-get" and not apt_updated:
+            # パッケージ一覧が古いと install が失敗するので、一度だけ update してやり直す
+            if verbose:
+                print("  パッケージ一覧を更新しています… （apt-get update）")
+            _run_command(["apt-get", "update"], 300)
+            apt_updated = True
+            ok, output = _run_command(cmd, timeout)
+
+        if ok:
+            if cmd[0] != "apt-get":
+                # japanize-matplotlibはimportした時点でフォントを登録してくれる
                 try:
-                    fm.fontManager.addfont(fp)
-                except Exception:
-                    pass
-            font_name = _find_cjk_font()
-    if font_name:
-        plt.rcParams["font.family"] = font_name
-        if verbose:
-            print(f"日本語フォントを設定しました: {font_name}")
-    elif verbose:
-        print("【警告】日本語フォントの自動設定に失敗しました。グラフ内の文字が『□』になる可能性があります。")
+                    import japanize_matplotlib  # noqa: F401
+                except Exception as e:
+                    if verbose:
+                        print(f"  japanize-matplotlib の読み込みに失敗しました: {e}")
+            _register_font_files(verbose=verbose)
+            name, path = _find_cjk_font()
+            if name is None:
+                _rebuild_font_manager()
+                name, path = _find_cjk_font()
+            if name:
+                return name, path
+            if verbose:
+                print(f"  {label} を入れましたが、日本語フォントとして認識できませんでした。")
+        elif verbose:
+            print(f"  {label} の導入に失敗しました: {output.splitlines()[-1] if output else '原因不明'}")
+
+    return None, None
+
+
+def _apply_font(font_name):
+    """指定したフォントを最優先にしつつ、既存のフォントを予備として残す。
+
+    font.family に1つだけ指定すると、そのフォントに無い記号（℃ や ⚠ など）が
+    豆腐文字になる。sans-serif の先頭に入れることで、無い字は他のフォントで
+    補われるようにする。
+    """
+    sans = [f for f in plt.rcParams["font.sans-serif"] if f != font_name]
+    plt.rcParams["font.sans-serif"] = [font_name] + sans
+    plt.rcParams["font.family"] = "sans-serif"
     plt.rcParams["axes.unicode_minus"] = False
-    return font_name
+
+
+def verify_japanese_font():
+    """いま matplotlib が実際に使うフォントを調べ、日本語が描けるかを返す。
+
+    戻り値: (描けるか(True/False/None), フォント名, ファイルパス)
+    rcParamsにフォント名を設定できても、matplotlibが解決に失敗して
+    DejaVu Sans に落ちていることがある（この状態が豆腐文字の正体）。
+    """
+    try:
+        prop = fm.FontProperties(family=plt.rcParams["font.family"])
+        path = fm.findfont(prop, fallback_to_default=True)
+    except Exception:
+        return None, None, None
+    try:
+        name = fm.get_font(path).family_name
+    except Exception:
+        name = os.path.basename(path)
+    return _font_file_supports_japanese(path), name, path
+
+
+_FONT_HELP = """
+  グラフの日本語が □（豆腐文字）になります。次のいずれかで解決できます。
+    Google Colab / Ubuntu : !apt-get -y install fonts-ipafont-gothic
+    どの環境でも          : pip install japanize-matplotlib
+    フォントを直接指定    : --font "IPAexGothic"  （環境変数 WEATHER_VIZ_FONT でも可）
+  インストール後は、Colabではランタイムを再起動せずそのまま再実行すれば反映されます。
+"""
+
+
+def setup_japanese_font(font_name=None, verbose: bool = True, allow_install=None):
+    """グラフ用の日本語フォントを設定する。
+
+    font_name を指定した場合はそれを使う（見つからなければ警告して自動選択に戻る）。
+    見つからない場合は、環境に応じてフォントの導入まで試みる。
+    最後に「本当に日本語が描けるか」を検証して結果を表示する。
+    """
+    if allow_install is None:
+        allow_install = not os.environ.get("WEATHER_VIZ_NO_FONT_INSTALL")
+    font_name = font_name or os.environ.get("WEATHER_VIZ_FONT")
+
+    if font_name:
+        available = {f.name for f in fm.fontManager.ttflist}
+        if font_name not in available:
+            _register_font_files()
+            available = {f.name for f in fm.fontManager.ttflist}
+        if font_name in available:
+            _apply_font(font_name)
+        elif verbose:
+            print(f"【警告】指定されたフォント『{font_name}』が見つかりません。自動選択に切り替えます。")
+            font_name = None
+
+    if not font_name:
+        name, _ = _find_cjk_font()
+        if name is None:
+            # 未登録のフォントファイルがあるかもしれないので、登録してから探し直す
+            _register_font_files()
+            name, _ = _find_cjk_font()
+        if name is None and allow_install:
+            if verbose:
+                print("日本語フォントが見つからないため、自動インストールを試みます…")
+            name, _ = _install_japanese_font(verbose=verbose)
+        if name:
+            _apply_font(name)
+        else:
+            plt.rcParams["axes.unicode_minus"] = False
+
+    supported, used_name, used_path = verify_japanese_font()
+    if verbose:
+        if supported:
+            print(f"日本語フォントを設定しました: {used_name}")
+            print(f"  （フォントファイル: {used_path}）")
+        elif supported is False:
+            print(f"【警告】いま使われるフォント『{used_name}』は日本語のグリフを持っていません。")
+            print(_FONT_HELP.rstrip())
+        else:
+            print(f"【注意】日本語フォントの確認ができませんでした（使用フォント: {used_name}）。")
+            print("　グラフの文字が □ になる場合は、次を試してください。")
+            print(_FONT_HELP.rstrip())
+    return used_name if supported else None
 
 
 setup_japanese_font(verbose=not bool(os.environ.get("WEATHER_VIZ_QUIET")))
@@ -1399,9 +1643,9 @@ def plot_single_location_forecast(main_df, phenom_df, col, location_mapping,
         if is_forecast_panel:
             # 凡例と重ならないよう、注記はパネルの見出しとして出す
             note = "ここから先は予測（背景グレー・点線）" if len(segments) == 1 else "予測ゾーン（背景グレー・点線）"
-            ax1.set_title(note, loc="left", fontsize=9, color="dimgray", fontweight="bold")
+            ax1.set_title(note, loc="left", fontsize=9, color="dimgray")
         elif len(segments) > 1:
-            ax1.set_title("実測", loc="left", fontsize=9, color="dimgray", fontweight="bold")
+            ax1.set_title("実測", loc="left", fontsize=9, color="dimgray")
 
     # 凡例は右端のパネルにまとめて出す（各パネルに出すと図が読みにくくなるため）
     ax1_last, axp_last, ax2_last = axes[0][-1], axes[1][-1], axes[2][-1]
@@ -1657,6 +1901,12 @@ def _parse_args(argv=None):
                         help="④のグラフに表示する実測データの日数")
     parser.add_argument("--no-forecast", action="store_true", help="霧予測（④⑤⑥）を行わない")
     parser.add_argument("--no-monthly", action="store_true", help="月別グラフ（①②）を作らない")
+    parser.add_argument("--font", default=None,
+                        help="グラフに使う日本語フォント名（例: IPAexGothic）")
+    parser.add_argument("--check-font", action="store_true",
+                        help="日本語フォントの状態を確認し、確認用の画像だけを出力して終了する")
+    parser.add_argument("--zip", action="store_true",
+                        help="出力フォルダをZIPにまとめる（Colabから持ち帰るとき用）")
     args = parser.parse_args(argv)
 
     # 「フォルダ 入力ファイル」の順で渡された場合も受け付ける（従来の柔軟な指定に合わせる）
@@ -1665,6 +1915,9 @@ def _parse_args(argv=None):
 
     if not looks_like_data_file(args.input) and looks_like_data_file(args.output):
         args.input, args.output = args.output, args.input
+    elif args.input and not looks_like_data_file(args.input) and args.output is None:
+        # 引数が1つだけで、それがデータファイルに見えない場合は出力フォルダとして扱う
+        args.input, args.output = None, args.input
     if args.input is None:
         args.input = DEFAULT_INPUT_FILE
     if args.output is None:
@@ -1672,44 +1925,152 @@ def _parse_args(argv=None):
     return args
 
 
-def main(argv=None):
-    args = _parse_args(argv)
-    filepath = _resolve_input_file(args.input)
+def plot_font_check(out_dir):
+    """日本語が正しく描けるか確認するための小さな画像を出力する。
 
+    グラフ本体を作る前に「文字化けしていないか」だけを数秒で確かめられるようにする。
+    """
+    supported, used_name, used_path = verify_japanese_font()
+    fig, ax = plt.subplots(figsize=(9, 3.2))
+    ax.axis("off")
+    ax.text(0.5, 0.72, "日本語フォント確認：只見川の川霧 予測グラフ", ha="center", fontsize=16)
+    ax.text(0.5, 0.45, "気温(℃)・露点温度(℃)・相対湿度(％)・風速(m/s)・降水量(mm)",
+            ha="center", fontsize=12)
+    ax.text(0.5, 0.20, f"使用フォント: {used_name}", ha="center", fontsize=10, color="dimgray")
+    out_path = os.path.join(out_dir, "font_check.png")
+    fig.savefig(out_path, dpi=SAVE_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"確認用の画像を出力しました: {out_path}")
+    if supported:
+        print("この画像の文字が読めれば、グラフの日本語は問題ありません。")
+    else:
+        print("上の警告のとおり、日本語が □ になる可能性が高い状態です。")
+    return out_path
+
+
+def display_in_notebook(paths, max_images: int = 8, width: int = 1100):
+    """Colabのセル内に、生成したグラフをそのまま表示する。
+
+    出力フォルダを開かなくても結果が確認できるようにするための表示処理。
+    枚数が多いときは max_images 枚だけ表示し、残りはファイル名だけ知らせる。
+    """
+    if not _in_notebook():
+        return []
+    try:
+        from IPython.display import Image, display
+    except ImportError:
+        return []
+
+    images = [p for p in paths if str(p).lower().endswith(".png")]
+    shown = images[:max_images]
+    for path in shown:
+        print(os.path.basename(path))
+        display(Image(filename=path, width=width))
+    if len(images) > len(shown):
+        print(f"（ほか{len(images) - len(shown)}枚は出力フォルダに保存されています）")
+    return shown
+
+
+def zip_outputs(out_dir, download: bool = False):
+    """出力フォルダをZIPにまとめる（Colabから手元に持ち帰るとき用）。"""
+    base = os.path.abspath(out_dir.rstrip("/"))
+    zip_path = shutil.make_archive(base, "zip", out_dir)
+    print(f"ZIPにまとめました: {zip_path}")
+    if download and "google.colab" in sys.modules:
+        try:
+            from google.colab import files as colab_files
+            colab_files.download(zip_path)
+        except Exception as e:
+            print(f"（自動ダウンロードに失敗しました: {e}　左のファイル一覧から手動で保存してください）")
+    return zip_path
+
+
+def run(input_file=None, output_dir=None, sheet=None, layout="auto",
+        lat=None, lon=None, forecast_days=None, history_days=5,
+        forecast=True, monthly=True, font=None, show=None,
+        zip_output=False, download=False):
+    """Colabのセルから直接呼べるエントリーポイント。
+
+        from weather_visualizer import run
+        run("/content/drive/MyDrive/只見_気象データ.xlsx")
+
+    引数はコマンドラインのオプションと同じ意味。show=True でグラフをセル内に表示、
+    zip_output=True で出力フォルダをZIPにまとめる（download=Trueでダウンロードまで）。
+    """
+    if font:
+        setup_japanese_font(font_name=font)
+
+    out_dir = output_dir or DEFAULT_OUTPUT_DIR
+    filepath = _resolve_input_file(input_file or DEFAULT_INPUT_FILE)
     if filepath is None:
-        print("【エラー】入力ファイルが指定されなかったか、見つかりませんでした。")
-        print(f"　指定されたパス: {args.input}")
-        print("　対応形式: .xlsx / .xlsm / .csv")
-        return 1
+        raise FileNotFoundError(
+            f"入力ファイルが見つかりません: {input_file or DEFAULT_INPUT_FILE}\n"
+            "　対応形式: .xlsx / .xlsm / .csv\n"
+            "　Colabでは左のファイル一覧にアップロードするか、Googleドライブをマウントして"
+            "そのパスを指定してください。"
+        )
 
-    out_dir = args.output
     os.makedirs(out_dir, exist_ok=True)
-
     print(f"ファイルを読み込み中: {filepath}")
     main_df, phenom_df, phenom_cols, location_mapping = load_weather_data(
-        filepath, sheet_name=args.sheet, layout=args.layout)
+        filepath, sheet_name=sheet, layout=layout)
 
     base = os.path.splitext(os.path.basename(filepath))[0]
     location_name = base.split("_")[0].split(" ")[0] if ("_" in base or " " in base) else base
 
-    if not args.no_monthly:
+    generated = []
+    if monthly:
         print(f"\n月ごと・全地点統合グラフの生成を開始します（{len(phenom_cols)}地点）...")
         made = plot_combo_by_month(main_df, phenom_df, phenom_cols, location_mapping,
                                    location_name, out_dir)
+        generated += made
         print(f"月別グラフを{len(made)}枚生成しました。出力先: {os.path.abspath(out_dir)}")
     else:
-        print("\n【--no-monthly】月別グラフ（①②）の生成をスキップしました。")
+        print("\n月別グラフ（①②）の生成はスキップしました。")
 
-    if args.no_forecast:
-        print("\n【--no-forecast】霧予測（④⑤⑥）の生成をスキップしました。")
+    if forecast:
+        generated += run_fog_prediction_addon(
+            main_df, phenom_df, phenom_cols, location_name, out_dir, location_mapping,
+            lat=lat, lon=lon, forecast_days=forecast_days, history_days=history_days,
+        )
+    else:
+        print("\n霧予測（④⑤⑥）の生成はスキップしました。")
+
+    print(f"\n完了しました。出力先フォルダ: {os.path.abspath(out_dir)}")
+
+    if show is None:
+        show = _in_notebook()  # ノートブックなら既定で表示する
+    if show:
+        # 予測グラフ（④⑤）を優先して表示する
+        priority = [p for p in generated if "④" in os.path.basename(p) or "⑤" in os.path.basename(p)]
+        display_in_notebook(priority + [p for p in generated if p not in priority])
+    if zip_output:
+        zip_outputs(out_dir, download=download)
+    return generated
+
+
+def main(argv=None):
+    args = _parse_args(argv)
+    if args.font:
+        setup_japanese_font(font_name=args.font)
+    elif args.check_font and not verify_japanese_font()[0]:
+        # 確認モードで日本語が描けない状態なら、もう一度導入を試みる
+        setup_japanese_font()
+
+    if args.check_font:
+        os.makedirs(args.output, exist_ok=True)
+        plot_font_check(args.output)
         return 0
 
-    run_fog_prediction_addon(
-        main_df, phenom_df, phenom_cols, location_name, out_dir, location_mapping,
-        lat=args.lat, lon=args.lon, forecast_days=args.forecast_days,
-        history_days=args.history_days,
-    )
-    print(f"\n完了しました。出力先フォルダ: {os.path.abspath(out_dir)}")
+    try:
+        run(input_file=args.input, output_dir=args.output, sheet=args.sheet, layout=args.layout,
+            lat=args.lat, lon=args.lon, forecast_days=args.forecast_days,
+            history_days=args.history_days, forecast=not args.no_forecast,
+            monthly=not args.no_monthly, zip_output=args.zip)
+    except FileNotFoundError as e:
+        print(f"【エラー】{e}")
+        return 1
     return 0
 
 
