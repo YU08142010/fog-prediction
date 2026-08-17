@@ -14,38 +14,79 @@
 
 ## Colabでの使い方（コピーして貼るだけ）
 
-### 1. プログラムを取ってくる
+> **`!` と `%` について**
+> Colab（Jupyter）のセルでは、先頭に `!` を付けると **その行はPythonではなくシェルコマンド**として実行されます（`!git clone` = ターミナルで `git clone` を打つのと同じ）。
+> 先頭の `%` は **Colab自身への命令（マジックコマンド）** です。`%cd` は `!cd` と違い、**そのセルだけでなく以降のセルにも作業フォルダの移動が反映されます**（`!cd` では移動が残らないため、必ず `%cd` を使ってください）。
+> どちらも打ち間違いではありません。**Colabのセルにそのままコピーして実行できます**（ただしローカルのターミナルにそのまま貼ると動きません。下の「ローカルPCで動かす場合」を参照）。
+
+### 1. プログラムを取ってくる（初回だけ）
 
 ```python
 !git clone https://github.com/YU08142010/fog-prediction.git
 %cd fog-prediction
 ```
 
-（2回目以降は `%cd fog-prediction` と `!git pull` だけでOKです）
+**2回目以降**（すでにcloneしてある同じセッション、または再接続後）は、cloneせずに最新版を取り直します。
 
-### 2. データを用意する
+```python
+%cd /content/fog-prediction
+!git pull
+```
 
-次のどちらでも構いません。
+- 1のセルをもう一度実行すると `fatal: destination path 'fog-prediction' already exists` というエラーになります。これは「すでに取ってきてある」という意味なので、上の `git pull` のセルを使ってください。
+- `git pull` で更新したあとは、**ランタイムを再起動**（メニューの「ランタイム」→「セッションを再起動」）してから 2 以降を実行してください。Pythonが古い方のプログラムを覚えたままになるためです。
 
-- **左のファイル一覧にドラッグ＆ドロップ**する（例: `/content/只見_気象データ.xlsx`）
-- **Googleドライブをマウント**して、ドライブ上のファイルを指定する
+### 2. まずサンプルデータで動くか試す
+
+このリポジトリには動作確認用の `data.csv`（只見川流域・4地点・2024年6〜9月）が入っています。**ファイルの用意なしで、そのまま実行できます。**
+
+```python
+from weather_visualizer import run
+
+run("data.csv")
+```
+
+- グラフは `./output_graphs`（＝`/content/fog-prediction/output_graphs`）に保存され、**Colabのセル内にも表示されます**。
+- 日本語フォントが無い場合は、初回実行時に自動でインストールします（下の「日本語が □ になる場合」参照）。
+- 追加ライブラリのインストールは基本的に不要です（Colabに最初から入っています）。
+- 予測グラフ（④⑤⑥）の生成にはインターネット接続が必要です（Open-Meteo APIから予報を取得するため）。
+
+### 3. 自分のデータで実行する
+
+**手順3でエラーになる原因のほとんどは、指定したパスにファイルが無いことです。** 次のいずれかの方法で、実在するパスを渡してください。
+
+**方法A：ファイルをアップロードする（かんたん）**
+
+Colab左端のフォルダアイコンを開き、ファイルを**ドラッグ＆ドロップ**します。アップロードしたファイルを右クリック →「パスをコピー」で正確なパスが得られます（通常 `/content/ファイル名.xlsx`）。
+
+```python
+run("/content/只見_気象データ.xlsx")   # ← コピーしたパスに置き換える
+```
+
+**方法B：Googleドライブのファイルを使う**
+
+Driveを使う場合は、**先にマウントが必要**です（マウントせずに `/content/drive/...` を指定するとエラーになります）。
 
 ```python
 from google.colab import drive
 drive.mount('/content/drive')
 ```
 
-### 3. 実行する
+マウント後、左のファイル一覧で `drive` → `MyDrive` とたどり、目的のファイルを右クリック →「パスをコピー」。
 
 ```python
-from weather_visualizer import run
-
-run("/content/drive/MyDrive/只見_気象データ.xlsx")
+run("/content/drive/MyDrive/只見_気象データ.xlsx")   # ← コピーしたパスに置き換える
 ```
 
-- グラフは `./output_graphs` に保存され、**Colabのセル内にも表示されます**。
-- 日本語フォントが無い場合は、初回実行時に自動でインストールします（下の「文字化けする場合」参照）。
-- 追加ライブラリのインストールは基本的に不要です（Colabに最初から入っています）。
+**方法C：パスが分からない／面倒なとき**
+
+引数なしで呼ぶと、ファイル選択（アップロード）画面が表示されます。
+
+```python
+run()
+```
+
+対応形式は `.xlsx` / `.xlsm` / `.csv` です。
 
 ### 4. 結果を手元に持ち帰る（任意）
 
@@ -60,7 +101,7 @@ run("/content/只見_気象データ.xlsx", zip_output=True, download=True)
 ```python
 run(
     "/content/只見_気象データ.xlsx",   # 入力ファイル（.xlsx / .xlsm / .csv）
-    "output_graphs",                  # 出力フォルダ
+    "output_graphs",                  # 出力フォルダ（既定: ./output_graphs）
     sheet=None,          # Excelのシート名（省略時は先頭シート）
     layout="auto",       # 列の決め方（"auto"=見出しから自動検出 / "fixed"=従来の固定列）
     lat=37.3486,         # 予報を取得する地点の緯度（既定＝只見町付近）
@@ -95,6 +136,47 @@ run(
 | `--font 名前` | グラフに使う日本語フォント名 | 自動 |
 | `--check-font` | 日本語フォントの確認だけ行う | - |
 | `--zip` | 出力フォルダをZIPにまとめる | - |
+
+---
+
+## よくあるエラーと対処
+
+| 表示されるメッセージ | 原因 | 対処 |
+|---|---|---|
+| `FileNotFoundError: 入力ファイルが見つかりません: ...` | 指定したパスにファイルが無い（Driveをマウントしていない／ファイル名の打ち間違い／まだアップロードしていない） | 左のファイル一覧でファイルを右クリック →「パスをコピー」して、そのパスを `run()` に貼る。または引数なしの `run()` でアップロード画面から選ぶ |
+| `fatal: destination path 'fog-prediction' already exists` | `git clone` を2回実行した | cloneし直さず `%cd /content/fog-prediction` → `!git pull` を使う |
+| `ModuleNotFoundError: No module named 'weather_visualizer'` | `%cd fog-prediction` を実行していない（または `!cd` を使ってしまった） | `%cd /content/fog-prediction` を実行してから `from weather_visualizer import run` |
+| `/bin/bash: line 1: git: ...` / `SyntaxError` になる | Colabのセル用の `!` `%` 付きの行を、ローカルのターミナルやPythonファイルにそのまま貼った | `!` `%` を外してターミナルで実行する（下の「ローカルPCで動かす場合」） |
+| `対応していないファイル形式です: .xls` | 旧形式のExcel（`.xls`）は未対応 | Excelで開いて `.xlsx` として保存し直す |
+| 予測（④⑤⑥）のところで通信エラーになる | Open-Meteo APIに接続できていない | 接続を確認して再実行する。予測が不要なら `run("data.csv", forecast=False)` |
+| `ダミー判定で全期間を除外` / `データ不足でスキップ` と表示されて予測が出ない | その地点の学習データが足りない（「/」の記録が無い、件数200件未満、現象が1種類のみ） | エラーではなく仕様です。「既知の制限・注意点」を参照 |
+| グラフの文字が □ になる | 日本語フォントが無い | 次の「グラフの日本語が □（豆腐文字）になる場合」を参照 |
+
+---
+
+## ローカルPCで動かす場合
+
+Colab前提で作っていますが、ローカルでも動きます。**`!` や `%` を付けずに**、ターミナルで実行してください。
+
+```bash
+git clone https://github.com/YU08142010/fog-prediction.git
+cd fog-prediction
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+
+# サンプルデータで動作確認
+python weather_visualizer.py data.csv
+```
+
+Pythonから呼ぶ場合はColabと同じです。
+
+```python
+from weather_visualizer import run
+run("data.csv")
+```
+
+ローカルではグラフの自動表示（セル内表示）とZIPの自動ダウンロードは行われません。出力は `./output_graphs` に保存されます。
 
 ---
 
@@ -136,10 +218,19 @@ run("データ.xlsx", font="IPAexGothic")
 
 ## 動作確認（テスト）
 
-```bash
-!python -m unittest -v test_weather_visualizer
+Colabのセルから:
+
+```python
+!python -m unittest test_weather_visualizer
 ```
 
+ローカルのターミナルから:
+
+```bash
+python -m unittest test_weather_visualizer
+```
+
+51件のテストがあり、すべて成功すると最後に `OK` と表示されます（`-v` を付けるとテスト名も表示されます）。
 ネットワークには接続しません（Open-Meteoへの通信はダミーに差し替えています）。
 
 ---
@@ -203,17 +294,21 @@ run("データ.xlsx", font="IPAexGothic")
 
 ## 出力されるファイル
 
+すべて出力フォルダ（既定 `./output_graphs`）に保存されます。
+ファイル名の先頭に付く `{接頭辞}` は、**入力ファイル名から自動で作られます**
+（`_` または半角スペースがあればその手前まで。例: `data.csv` → `data_…`、`只見_気象データ.xlsx` → `只見_…`）。
+
 ### ①②：気象データ × 現象コード（月別・全地点まとめ）
 
-- `{地点名}_①気温・湿度・露点×現象コード_YYYY-MM.png`
-- `{地点名}_②風速・降水量×現象コード_YYYY-MM.png`
+- `{接頭辞}_①気温・湿度・露点×現象コード_YYYY-MM.png`
+- `{接頭辞}_②風速・降水量×現象コード_YYYY-MM.png`
 
 上段が気温・湿度・露点温度・風速・降水量の時系列、下段が全地点ぶんの現象コードを
 色分けした帯（レーン）で表示します。横軸の日付は `年/月/日` 形式です。
 
 ### ④：地点ごとの16日間予測グラフ
 
-- `{地点名}_④{観測地点名}_16日間予測_YYYYMMDD.png`
+- `{接頭辞}_④{観測地点名}_16日間予測_YYYYMMDD.png`
 
 - **上段**：直近5日間の実測気温・露点・湿度（実線）＋ 今後16日間の予報（同色・点線）
 - **中段**：**霧（コード1〜6）の予測確率**。多クラス分類の予測は多数派の「/」に寄りやすいため、
@@ -225,14 +320,14 @@ run("データ.xlsx", font="IPAexGothic")
 
 ### ⑤：日別霧予測サマリー
 
-- `{地点名}_⑤日別霧予測サマリー_YYYYMMDD.png`
+- `{接頭辞}_⑤日別霧予測サマリー_YYYYMMDD.png`
 
 日ごとに「霧（コード1〜6）が予測された地点数」を棒グラフに、
 「霧確率の平均（全地点・全時刻）」を折れ線で重ねて表示します。
 
 ### ⑥：予測結果CSV
 
-- `{地点名}_⑥予測結果_YYYYMMDD.csv`
+- `{接頭辞}_⑥予測結果_YYYYMMDD.csv`
 
 1時間ごとに、地点ごとの予測コードと霧確率（％）を並べたCSVです（BOM付きUTF-8。Excelでそのまま開けます）。
 
