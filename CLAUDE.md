@@ -7,7 +7,7 @@
 只見川流域の川霧を観測データからグラフ化し、機械学習で予測するプログラムです。
 
 - **実行環境の前提は Google Colab**。ローカルでも動きますが、日本語フォントの自動導入・ファイルのアップロード／ダウンロード支援は Colab に合わせて作られています。
-- 実体は **単一ファイル `weather_visualizer.py`（約2400行）** です。パッケージ化・モジュール分割はしていません。ファイル冒頭のモジュール docstring に全体仕様が書かれています。
+- 実体は **単一ファイル `weather_visualizer.py`（約3300行）** です。パッケージ化・モジュール分割はしていません。ファイル冒頭のモジュール docstring に全体仕様が書かれています。
 - ユーザーは Colab のセルに README のコードを貼って実行します。**README の手順がそのまま動くことが最優先の受け入れ条件**です。
 
 ## ファイル構成
@@ -15,7 +15,7 @@
 | ファイル | 役割 |
 |---|---|
 | `weather_visualizer.py` | 本体（読み込み・グラフ・学習・予測・CLI・Colab支援のすべて） |
-| `test_weather_visualizer.py` | unittest（69件）。ネットワークには接続しない |
+| `test_weather_visualizer.py` | unittest（86件）。ネットワークには接続しない |
 | `test.xlsx` | 動作確認用のサンプル（**本番と同じ形式**。只見川流域32地点・2024年6月〜2026年6月。現象コードは仮の値なので予測精度の評価には使えない） |
 | `README.md` | Colab利用者向けの手順書 |
 | `requirements.txt` | pandas / numpy / matplotlib / openpyxl / scikit-learn / xgboost / requests |
@@ -50,7 +50,7 @@
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# テスト（ネットワーク不要・約35秒）
+# テスト（ネットワーク不要・約50秒）
 python -m unittest test_weather_visualizer
 
 # サンプルデータで動作確認（予測なし＝ネットワーク不要・数秒）
@@ -86,6 +86,14 @@ python weather_visualizer.py --check-font
 - ハイブリッドの混合比は**学習データのさらに後ろ20%（検証期間）だけ**で決めます（`_choose_blend_weight()`）。テスト期間で選ぶとスコアが甘くなります。
 - `xgboost` の import は try/except で囲み、無い環境では RandomForest 単独に降格します（`_HAS_XGBOOST` / `_resolve_model_kind()`）。この分岐を消さないこと。
 - XGBoost はラベルが 0,1,2,… と連続している必要があります。現象コードは歯抜けになるため、`_XGBLabelSafeClassifier` が符号化を担っています。XGBoost を直接使う書き方に戻さないこと。
+- 霧確率のしきい値（`fog_threshold`）も混合比と同じ**検証期間**で選びます（`_choose_fog_threshold()`）。テスト期間で選ばないこと。
+- `_lag_series()` は行の位置ではなく **datetime の値そのもの**で「N時間前」を引き当てます（`reindex`）。位置ベースの `.shift(n)` に書き換えると、欠測で行が飛んでいる箇所や実測/予報のつなぎ目で誤った差分を計算するようになります。
+- 任意項目（日照時間・気圧など）の特徴量採否は `OPTIONAL_MEASURE_MIN_COVERAGE`（既定5%）で決まります。この判定は `_fill_optional_measures()` で埋める**前**の生データの有効値割合を見る必要があります（埋めた後に判定すると全項目が「有効」になってしまう）。
+- 共通モデル（`_rescue_with_pooled_model()`）で救った地点は、他の地点と**同じ `pipe` オブジェクトを共有**します。地点ごとに複製する必要はありません（`HybridFogClassifier.predict()` は地点の状態を持たないため）。
+- `train_location_models()` が返す辞書から `rf_pipe`/`xgb_pipe` は最後に `pop()` されます（`_top_feature_importances()` などの内部処理でだけ使うため）。これらのキーに戻り値側で依存するコードを追加しないこと。
+- `--model-cache` で保存したファイルは `joblib.dump()` された生の `models` 辞書（sklearn/xgboostオブジェクトそのもの）です。バージョン間の互換性は保証されないため、scikit-learn/xgboostのバージョンを変えたら作り直す必要がある旨をユーザーに伝えること。
+- 進捗バー（`_ProgressBar`）は `\r` で同じ行を上書きします。ループの途中で通常の `print()` を挟むと表示が崩れるため、ループ内で表示したい情報はリストに集めておき、`progress.close()` の後にまとめて表示するパターン（`train_location_models()` 参照）に合わせること。
+- `run()` は実行ログを `_TeeOutput` で `sys.stdout` に差し込みます。例外発生時も `finally` で必ず `sys.stdout` を元に戻しているので、この try/finally 構造は崩さないこと。
 
 ### 出力ファイル名
 

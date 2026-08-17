@@ -53,11 +53,14 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
+import math
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 import unicodedata
 from datetime import date, datetime, timedelta
 
@@ -79,7 +82,7 @@ from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import accuracy_score, f1_score, make_scorer, precision_score, recall_score
 from sklearn.utils.class_weight import compute_sample_weight
 
 # XGBoost は Google Colab には標準で入っている。入っていない環境
@@ -91,6 +94,70 @@ try:
 except Exception:
     XGBClassifier = None
     _HAS_XGBOOST = False
+
+# joblib は scikit-learn の依存として必ず入っているので、追加ライブラリは増えない
+from joblib import dump as _joblib_dump, load as _joblib_load
+
+
+# ===========================================================================
+# 共通ユーティリティ（表の桁揃え・進捗表示）
+# ---------------------------------------------------------------------------
+# 日本語（全角）と数字・記号（半角）が混在する表を、文字数ではなく「表示幅」で
+# 揃えるためのヘルパー。f"{s:<16}" は文字数で詰めるため、全角の多い地点名
+# （例:「伊奈川合流地点」）と少ない地点名（例:「木賊」）で表がずれてしまう。
+# ===========================================================================
+
+def _disp_width(s) -> int:
+    """全角文字を2、半角を1として数えた表示幅（ターミナル・Colab出力の桁数に対応）。"""
+    return sum(2 if unicodedata.east_asian_width(ch) in "FWA" else 1 for ch in str(s))
+
+
+def _pad(s, width, align="<") -> str:
+    """表示幅ベースで空白を埋める（`_disp_width` を使うため全角混在でも桁が揃う）。"""
+    s = str(s)
+    fill = " " * max(0, width - _disp_width(s))
+    return (fill + s) if align == ">" else (s + fill)
+
+
+def _progress_enabled() -> bool:
+    """テストや非対話実行では進捗バーの上書き表示をしない（ログが読みにくくなるため）。"""
+    return not bool(os.environ.get("WEATHER_VIZ_QUIET"))
+
+
+class _ProgressBar:
+    """時間のかかる繰り返し処理の進捗を1行に表示する（外部ライブラリを増やさない簡易版）。
+
+    `\\r` で同じ行を上書きするため、地点ごとの学習やグラフ生成のような
+    「無言の時間が続く」処理でも、今どこまで進んだかをその場で確認できる。
+    """
+
+    def __init__(self, total, prefix="", width=24, enabled=None):
+        self.total = max(1, int(total))
+        self.prefix = prefix
+        self.width = width
+        self.enabled = _progress_enabled() if enabled is None else enabled
+        self._n = 0
+        self._start = time.time()
+        self._last_len = 0
+
+    def update(self, n: int = 1, suffix: str = ""):
+        self._n = min(self.total, self._n + n)
+        if not self.enabled:
+            return
+        frac = self._n / self.total
+        filled = int(self.width * frac)
+        bar = "█" * filled + "░" * (self.width - filled)
+        elapsed = time.time() - self._start
+        line = f"  {self.prefix} [{bar}] {self._n}/{self.total}（{frac:.0%}） 経過{elapsed:.0f}秒 {suffix}"
+        pad = max(0, self._last_len - len(line))
+        sys.stdout.write("\r" + line + " " * pad)
+        sys.stdout.flush()
+        self._last_len = len(line)
+
+    def close(self):
+        if self.enabled:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
 
 
 # ===========================================================================
@@ -422,15 +489,31 @@ MEASURE_KEYWORDS = {
     "露点温度(℃)": ["露点"],
     "相対湿度(％)": ["相対湿度", "湿度"],
 }
+
+# 必須ではないが、ファイルにあれば予測の特徴量として自動的に使う気象要素。
+# 見つからなくても警告は出さない（`OPTIONAL_MEASURE_MIN_COVERAGE` 未満のときも同様、
+# 特徴量として使わないだけで実行は止めない）。
+OPTIONAL_MEASURE_KEYWORDS = {
+    "日照時間(時間)": ["日照"],
+    "気圧(hPa)": ["気圧", "現地気圧", "海面気圧"],
+    "日射量(MJ/m2)": ["日射量", "日射"],
+    "視程(km)": ["視程"],
+}
+# ファイル中の有効値の割合がこれ未満の任意項目は、学習データを大きく減らさないよう
+# 特徴量に加えない（例: 値が数%しか入っていない列を使うと dropna で大半の行が消える）。
+OPTIONAL_MEASURE_MIN_COVERAGE = 0.05
+
 WIND_DIR_LABEL = "風向"
 WIND_DIR_KEYWORDS = ["風向"]
 DATETIME_KEYWORDS = ["年月日時", "年月日", "日時", "日付", "時刻"]
 
 # 気象庁データや観測記録に含まれる補助列（これらは観測地点ではないので現象コード列とみなさない）
+# 「視程」「日照」「気圧」「日射」は OPTIONAL_MEASURE_KEYWORDS で気象要素として扱うため、
+# ここには含めない（含めると測定値の列自体が最初の判定で弾かれてしまう）。
 NON_LOCATION_KEYWORDS = [
     "品質情報", "均質番号", "現象なし情報", "備考", "合計", "平均", "最大", "最小",
-    "天気", "雲量", "視程", "日照", "積雪", "降雪", "気圧", "蒸気圧", "番号", "単位",
-    "水温", "水位", "流量", "流速", "波高", "潮位", "日射",
+    "天気", "雲量", "積雪", "降雪", "蒸気圧", "番号", "単位",
+    "水温", "水位", "流量", "流速", "波高", "潮位",
 ]
 
 # 「〜(℃)」「〜(mm)」のように単位が付いた見出しは観測値の列であって地点名ではない。
@@ -763,7 +846,9 @@ def _is_metadata_header(texts):
 
 
 def _is_measure_header(texts):
-    all_keys = [k for keys in MEASURE_KEYWORDS.values() for k in keys] + WIND_DIR_KEYWORDS + DATETIME_KEYWORDS
+    all_keys = ([k for keys in MEASURE_KEYWORDS.values() for k in keys]
+                + [k for keys in OPTIONAL_MEASURE_KEYWORDS.values() for k in keys]
+                + WIND_DIR_KEYWORDS + DATETIME_KEYWORDS)
     if any(any(kw in t for kw in all_keys) for t in texts):
         return True
     # 「水温(℃)」のように既知のキーワードに無い観測項目でも、単位が付いていれば観測値の列
@@ -841,7 +926,8 @@ def detect_layout(grid, header_row, layout="auto"):
     sub_rows = _find_subheader_rows(grid, header_row, dt_col)
     data_start = header_row + 1 + len(sub_rows)
 
-    measures = {label: None for label in MEASURE_KEYWORDS}
+    all_measure_keywords = {**MEASURE_KEYWORDS, **OPTIONAL_MEASURE_KEYWORDS}
+    measures = {label: None for label in all_measure_keywords}
     wind_dir_col = None
     for c in range(width):
         if c == dt_col:
@@ -849,7 +935,7 @@ def detect_layout(grid, header_row, layout="auto"):
         texts = _header_texts(grid, c, header_row, sub_rows)
         if not texts or _is_metadata_header(texts):
             continue
-        for label, keywords in MEASURE_KEYWORDS.items():
+        for label, keywords in all_measure_keywords.items():
             if measures[label] is None and any(kw in t for kw in keywords for t in texts):
                 measures[label] = c
                 break
@@ -974,6 +1060,14 @@ def load_weather_data(filepath, sheet_name=None, layout="auto", verbose=True):
             values = [_grid_get(grid, data_start + i, col) for i in range(len(data_rows))]
             main_data[label] = pd.to_numeric(pd.Series(values, dtype="object"), errors="coerce")
 
+    # 任意項目（日照時間・気圧など）は見つかった場合だけ列を作る。
+    # 見つからない列を毎回NaN列として増やすと、後続の処理が煩雑になるだけなので作らない。
+    for label in OPTIONAL_MEASURE_KEYWORDS:
+        col = info["measures"].get(label)
+        if col is not None:
+            values = [_grid_get(grid, data_start + i, col) for i in range(len(data_rows))]
+            main_data[label] = pd.to_numeric(pd.Series(values, dtype="object"), errors="coerce")
+
     if info["wind_dir"] is not None:
         wd = [_grid_get(grid, data_start + i, info["wind_dir"]) for i in range(len(data_rows))]
         main_data[WIND_DIR_LABEL] = pd.Series([encode_wind_direction(v) for v in wd], dtype="float64")
@@ -1030,14 +1124,22 @@ def _print_load_report(filepath, header_row, info, main_df, phenom_cols, locatio
     print(f"  ファイル : {os.path.abspath(filepath)}")
     print(f"  見出し行 : {header_row + 1}行目　列レイアウト: {info['source']}")
     print(f"  日時列   : {get_column_letter(info['datetime'] + 1)}列")
-    for label in MAIN_COLUMNS.values():
-        col = info["measures"].get(label)
+    for label, col in info["measures"].items():
+        is_optional = label in OPTIONAL_MEASURE_KEYWORDS
+        if is_optional and col is None:
+            continue  # 任意項目が無いのは普通のことなので、毎回は表示しない
         where = f"{get_column_letter(col + 1)}列" if col is not None else "見つからず（欠測扱い）"
         n_valid = int(main_df[label].notna().sum()) if label in main_df else 0
-        print(f"  {label:<12}: {where:<20} 有効値 {n_valid}件")
+        coverage = n_valid / len(main_df) if len(main_df) else 0.0
+        if is_optional:
+            tag = ("（任意・特徴量として使用）" if coverage >= OPTIONAL_MEASURE_MIN_COVERAGE
+                  else "（任意・有効値が少ないため特徴量には使いません）")
+        else:
+            tag = ""
+        print(f"  {_pad(label, 14)}: {_pad(where, 20)} 有効値 {n_valid}件{tag}")
     if info["wind_dir"] is not None:
-        print(f"  {WIND_DIR_LABEL:<12}: {get_column_letter(info['wind_dir'] + 1)}列"
-              f"{'':<14} 有効値 {int(main_df[WIND_DIR_LABEL].notna().sum())}件")
+        print(f"  {_pad(WIND_DIR_LABEL, 14)}: {_pad(get_column_letter(info['wind_dir'] + 1) + '列', 20)}"
+              f" 有効値 {int(main_df[WIND_DIR_LABEL].notna().sum())}件")
     print(f"  期間     : {main_df['datetime'].min()} 〜 {main_df['datetime'].max()}（{len(main_df)}行）")
 
     if missing_measures:
@@ -1247,17 +1349,44 @@ def plot_wind_precip(main_df, phenom_df, phenom_cols, location_mapping, location
     plt.close(fig)
 
 
+# ①②のレーンをこれ以上の地点数にしない（読みやすさのため、超える場合は画像を分割する）
+MAX_LOCATIONS_PER_MONTHLY_IMAGE = 16
+
+
+def _cols_with_data_in_month(psub, phenom_cols):
+    """その月に実際に記録（「/」も含む）がある地点の列だけを残す。
+
+    記録が無い地点までレーンに描くと、その月の大半が空白のレーンになり読みにくくなる
+    （観測期間が月の途中からしかない場合など）。
+    """
+    return [col for col in phenom_cols if psub[col].map(encode_phenomena_cell).notna().any()]
+
+
+def _chunk_locations(cols, size):
+    return [cols[i:i + size] for i in range(0, len(cols), size)]
+
+
 def plot_combo_by_month(main_df, phenom_df, phenom_cols, location_mapping, location_name, out_dir):
+    months = [(ym, msub, psub) for ym, msub, psub in split_by_month_two(main_df, phenom_df)
+             if msub["datetime"].nunique() >= 2]
     generated = []
-    for ym, msub, psub in split_by_month_two(main_df, phenom_df):
-        if msub["datetime"].nunique() < 2:
+    progress = _ProgressBar(len(months), prefix="①② 月別グラフ")
+    for ym, msub, psub in months:
+        progress.update(1, suffix=ym)
+        cols_with_data = _cols_with_data_in_month(psub, phenom_cols)
+        if not cols_with_data:
             continue
-        loc = f"{location_name}（{ym}）"
-        p1 = os.path.join(out_dir, f"{location_name}_①気温・湿度・露点×現象コード_{ym}.png")
-        p2 = os.path.join(out_dir, f"{location_name}_②風速・降水量×現象コード_{ym}.png")
-        plot_temp_humid_dew(msub, psub, phenom_cols, location_mapping, loc, p1)
-        plot_wind_precip(msub, psub, phenom_cols, location_mapping, loc, p2)
-        generated += [p1, p2]
+        chunks = _chunk_locations(cols_with_data, MAX_LOCATIONS_PER_MONTHLY_IMAGE)
+        for idx, chunk_cols in enumerate(chunks, start=1):
+            suffix = f"_{idx}of{len(chunks)}" if len(chunks) > 1 else ""
+            loc = (f"{location_name}（{ym}）" if len(chunks) == 1
+                  else f"{location_name}（{ym}　{idx}/{len(chunks)}）")
+            p1 = os.path.join(out_dir, f"{location_name}_①気温・湿度・露点×現象コード_{ym}{suffix}.png")
+            p2 = os.path.join(out_dir, f"{location_name}_②風速・降水量×現象コード_{ym}{suffix}.png")
+            plot_temp_humid_dew(msub, psub, chunk_cols, location_mapping, loc, p1)
+            plot_wind_precip(msub, psub, chunk_cols, location_mapping, loc, p2)
+            generated += [p1, p2]
+    progress.close()
     return generated
 
 
@@ -1286,6 +1415,17 @@ SUMMARY_FOG_CODES = {1, 2, 3, 4, 5, 6}  # サマリー集計・霧F1評価・霧
 # 地点ごとにモデルを学習するための最低条件（これを満たさない地点はスキップする）
 MIN_ROWS_PER_LOCATION = 200
 MIN_CLASSES_PER_LOCATION = 2  # 最低2種類以上の現象コードが記録されている必要がある
+
+# 個別モデルの条件を満たさない地点を「全地点共通モデル」で補う（プーリング）ときの条件。
+# 個別モデルの下限（MIN_ROWS_PER_LOCATION）はそのままに、データが少ない地点は
+# 他地点のデータも借りたモデルで予測できるようにする。
+MIN_TOTAL_ROWS_FOR_POOLING = 500   # 共通モデル自体を学習するための全地点合計の最低件数
+MIN_ROWS_FOR_POOLED_RESCUE = 30    # 地点ごとの評価ができる最低件数（これ未満は共通モデルでも救わない）
+
+# 霧確率がこの値以上なら「霧」と判定する、というしきい値の探索範囲。
+# 既定の50%に根拠はないため、地点ごとに検証期間でF1が最大になる値を選ぶ（`_choose_fog_threshold()`）。
+FOG_THRESHOLD_GRID = tuple(round(t, 2) for t in np.arange(0.05, 1.0, 0.05))
+DEFAULT_FOG_THRESHOLD = 0.5
 
 # RandomizedSearchCVで探索するハイパーパラメータの範囲（RandomForest）
 PARAM_DIST = {
@@ -1331,6 +1471,92 @@ def build_location_class_targets(phenom_df, phenom_cols):
     return targets
 
 
+# 直近の変化量・移動平均を表す特徴量名（`_add_lag_features()` が作る）
+LAG_FEATURE_NAMES = ["気温変化_1h", "気温変化_3h", "風速平均_3h", "降水量_24h合計"]
+# 日の出までの残り時間を表す特徴量名（`_add_sunrise_feature()` が作る）
+SUN_FEATURE_NAME = "日の出まで残り時間"
+
+
+def _lag_series(df, col, hours):
+    """`col` の `hours` 時間前の値。ちょうどその時刻の実測が無ければNaNになる。
+
+    位置（何行前か）ではなく datetime そのもので引き当てるため、欠測で行が飛んでいたり
+    実測と予報のつなぎ目をまたいだりしても、誤った時間差を計算しない。
+    """
+    s = df.drop_duplicates(subset="datetime").set_index("datetime")[col]
+    lookup = pd.DatetimeIndex(df["datetime"]) - pd.Timedelta(hours=hours)
+    return pd.Series(s.reindex(lookup).to_numpy(), index=df.index)
+
+
+def _add_lag_features(df):
+    """直近の変化量・移動平均を特徴量として追加する。
+
+    川霧は「その瞬間の気温」よりも「直近でどれだけ気温が下がったか」
+    「前日までにどれだけ雨が降ったか」に強く左右されるため、瞬間値だけでは
+    表現できない時間的な文脈を補う（現在の主要な精度改善策の一つ）。
+    """
+    df = df.copy()
+    if "気温(℃)" in df.columns:
+        df["気温変化_1h"] = df["気温(℃)"] - _lag_series(df, "気温(℃)", 1)
+        df["気温変化_3h"] = df["気温(℃)"] - _lag_series(df, "気温(℃)", 3)
+
+    dedup = df.drop_duplicates(subset="datetime").sort_values("datetime")
+    dt_index = pd.DatetimeIndex(dedup["datetime"])
+    target_index = pd.DatetimeIndex(df["datetime"])
+
+    if "風速(m/s)" in df.columns:
+        s = pd.Series(pd.to_numeric(dedup["風速(m/s)"], errors="coerce").to_numpy(), index=dt_index)
+        rolled = s.rolling("3h", min_periods=1).mean()
+        df["風速平均_3h"] = rolled.reindex(target_index).to_numpy()
+
+    if "降水量(mm)" in df.columns:
+        precip = pd.to_numeric(dedup["降水量(mm)"], errors="coerce").fillna(0.0)
+        s = pd.Series(precip.to_numpy(), index=dt_index)
+        rolled = s.rolling("24h", min_periods=1).sum()
+        df["降水量_24h合計"] = rolled.reindex(target_index).to_numpy()
+    return df
+
+
+def _sunrise_hour(ts: pd.Timestamp, lat: float, lon: float) -> float:
+    """その日の日の出時刻を、その日の0時(JST)からの経過時間（h）で近似する。
+
+    NOAAの簡易式（標高0m・大気差補正なし）。実用上は数分の誤差があるが、
+    「明け方らしさ」を特徴量にするには十分な精度。
+    """
+    n = ts.timetuple().tm_yday
+    lat_rad = math.radians(lat)
+    decl = math.radians(23.44) * math.sin(math.radians(360.0 / 365.0 * (n - 81)))
+    cos_hour_angle = -math.tan(lat_rad) * math.tan(decl)
+    cos_hour_angle = max(-1.0, min(1.0, cos_hour_angle))  # 極域などの白夜/極夜を簡易に丸める
+    hour_angle_deg = math.degrees(math.acos(cos_hour_angle))
+    solar_noon = 12.0 - lon / 15.0 + 9.0  # JST(UTC+9)における太陽正午の近似
+    return solar_noon - hour_angle_deg / 15.0
+
+
+def _add_sunrise_feature(df, lat=None, lon=None):
+    """『日の出まで残り何時間か』を特徴量として追加する（日中は0）。
+
+    川霧は放射冷却で気温が下がりきる明け方に発生しやすいが、日の出時刻は季節で
+    大きく変わるため、「月」と「時刻」だけでは季節ごとの日の出の早い/遅いを
+    表現しきれない。緯度経度は予報取得地点（既定=只見町付近）で近似する
+    （只見川流域は数十km四方に収まるため、地点間の日の出時刻の差は実用上小さい）。
+    """
+    lat = FORECAST_LAT if lat is None else lat
+    lon = FORECAST_LON if lon is None else lon
+    df = df.copy()
+    dt = pd.to_datetime(df["datetime"])
+    day_start = dt.dt.normalize()
+    hour_of_day = (dt - day_start).dt.total_seconds().to_numpy() / 3600.0
+
+    unique_days = day_start.unique()
+    sunrise_by_day = {d: _sunrise_hour(pd.Timestamp(d), lat, lon) for d in unique_days}
+    sunrise_hours = day_start.map(sunrise_by_day).to_numpy(dtype="float64")
+
+    remaining = sunrise_hours - hour_of_day
+    df[SUN_FEATURE_NAME] = np.where((remaining < 0) | (remaining > 12), 0.0, remaining)
+    return df
+
+
 def _add_time_features(df):
     """気象データ／予報データに、モデルが使う時間特徴量を追加する共通処理。"""
     df = df.copy()
@@ -1339,6 +1565,8 @@ def _add_time_features(df):
     df["気温露点差"] = df["気温(℃)"] - df["露点温度(℃)"]
     df["時_sin"] = np.sin(2 * np.pi * df["時"] / 24)
     df["時_cos"] = np.cos(2 * np.pi * df["時"] / 24)
+    df = _add_lag_features(df)
+    df = _add_sunrise_feature(df)
     if WIND_DIR_LABEL in df.columns:
         # 風向は角度なので、そのまま数値にすると「北(0度)」と「北北西(337.5度)」が
         # 遠い値になってしまう。sin/cosに分解して円周上の近さを保つ。
@@ -1350,11 +1578,41 @@ def _add_time_features(df):
 
 
 def select_feature_names(df):
-    """そのデータフレームで実際に使える特徴量名のリストを返す。"""
+    """そのデータフレームで実際に使える特徴量名のリストを返す。
+
+    気温・降水量などの基本項目に加えて、
+    - 風向（列があるときだけ、sin/cosの2列）
+    - 日照時間・気圧など任意の気象要素（ファイルにあり、有効値が十分あるときだけ）
+    - 直近の変化量・日照時間帯などの時間的な文脈特徴量（`_add_time_features()` が作る）
+    を、実際にそのデータフレームで使える分だけ加える。
+    """
     features = list(BASE_FEATURES)
     if all(f in df.columns for f in WIND_DIR_FEATURES):
         features += WIND_DIR_FEATURES
+    for label in OPTIONAL_MEASURE_KEYWORDS:
+        if label in df.columns and df[label].notna().any():
+            features.append(label)
+    features += [f for f in LAG_FEATURE_NAMES if f in df.columns]
+    if SUN_FEATURE_NAME in df.columns:
+        features.append(SUN_FEATURE_NAME)
     return features
+
+
+def _fill_optional_measures(df):
+    """任意の気象要素（日照時間・気圧など）の欠測を、その列の中央値で埋める。
+
+    降水量と違って「無ければ0」とは言えない量（気圧など）なので中央値で埋める。
+    有効値の割合が低い列はそのままNaNにし、`select_feature_names()` に除外させる
+    （dropnaで学習データの大半が消えるのを防ぐため）。
+    """
+    df = df.copy()
+    for label in OPTIONAL_MEASURE_KEYWORDS:
+        if label not in df.columns:
+            continue
+        col = pd.to_numeric(df[label], errors="coerce")
+        coverage = col.notna().mean() if len(col) else 0.0
+        df[label] = col.fillna(col.median()) if coverage >= OPTIONAL_MEASURE_MIN_COVERAGE else np.nan
+    return df
 
 
 def prepare_features(df, feature_names=None, fill_precip_zero=True):
@@ -1364,8 +1622,21 @@ def prepare_features(df, feature_names=None, fill_precip_zero=True):
     （そうしないと dropna でほとんどの行が学習から消えてしまう）。
     """
     out = _add_time_features(df)
+    out = _fill_optional_measures(out)
     if fill_precip_zero and "降水量(mm)" in out.columns:
         out["降水量(mm)"] = pd.to_numeric(out["降水量(mm)"], errors="coerce").fillna(0.0)
+
+    # 直近の変化量は、ちょうどN時間前の実測が無い行（データの先頭・欠測の直後など）で
+    # NaNになる。学習データが欠測直後にごっそり失われないよう、妥当な既定値で埋める
+    # （気温変化=0＝「直近の変化は不明」、風速平均=その時刻の風速、降水量合計=0mm）。
+    for name in ("気温変化_1h", "気温変化_3h"):
+        if name in out.columns:
+            out[name] = out[name].fillna(0.0)
+    if "風速平均_3h" in out.columns and "風速(m/s)" in out.columns:
+        out["風速平均_3h"] = out["風速平均_3h"].fillna(out["風速(m/s)"])
+    if "降水量_24h合計" in out.columns:
+        out["降水量_24h合計"] = out["降水量_24h合計"].fillna(0.0)
+
     if feature_names is None:
         feature_names = select_feature_names(out)
     for name in feature_names:
@@ -1388,6 +1659,23 @@ def _fog_class_f1(y_true, y_pred):
     if not fog_labels:
         return np.nan
     return f1_score(y_true, y_pred, labels=fog_labels, average="macro", zero_division=0)
+
+
+def _blend_score(y_true, y_pred):
+    """モデル選び（探索・混合比）で使う評価値。霧F1を優先し、対象に霧が無ければmacro F1。
+
+    以前は探索の目的関数が f1_macro（全クラス平等）だったため、「/」以外の
+    非霧クラス（層雲・雨など）の当たりも霧と同じ重みで最適化されていた。
+    霧予測が主目的なので、霧F1を直接の目的関数にする。
+    """
+    score = _fog_class_f1(y_true, y_pred)
+    if np.isnan(score):
+        score = f1_score(y_true, y_pred, average="macro", zero_division=0)
+    return score
+
+
+# RandomizedSearchCVの探索目的関数として使う（"f1_macro"のような文字列指定の代わり）。
+FOG_F1_SCORER = make_scorer(_blend_score)
 
 
 def compute_fog_probability(pipe, X):
@@ -1544,8 +1832,9 @@ def _fit_component(kind, X_train, y_train, loc_name):
 
     戻り値: (学習済みPipeline, 採用パラメータ, 探索できたか)
     時系列データなのでTimeSeriesSplitを使い、未来データが学習に混ざらないようにする。
-    「/」が大多数の不均衡データではaccuracyだと「常に/」でも高得点になるため、
-    少数クラスも評価されるf1_macroを探索の目的関数にする。
+    探索の目的関数は霧F1（`FOG_F1_SCORER`）にしている。「/」が大多数の不均衡データでは
+    accuracyだと「常に/」でも高得点になり、f1_macroだと霧以外のクラスも霧と同じ重みで
+    最適化されてしまうため、霧の当たり具合を直接最適化する。
     """
     label = "RandomForest" if kind == "rf" else "XGBoost"
     param_dist = PARAM_DIST if kind == "rf" else XGB_PARAM_DIST
@@ -1558,7 +1847,7 @@ def _fit_component(kind, X_train, y_train, loc_name):
             search = RandomizedSearchCV(
                 _make_base_pipe(kind), param_dist, n_iter=n_iter,
                 cv=TimeSeriesSplit(n_splits=cv_splits),
-                scoring="f1_macro", random_state=42, n_jobs=-1, error_score="raise",
+                scoring=FOG_F1_SCORER, random_state=42, n_jobs=-1, error_score="raise",
             )
             search.fit(X_train, y_train)
             return search.best_estimator_, search.best_params_, True
@@ -1577,14 +1866,6 @@ def _refit_component(kind, params, X_train, y_train):
     return pipe
 
 
-def _blend_score(y_true, y_pred):
-    """混合比を選ぶときの評価値。霧F1を優先し、検証期間に霧が無ければmacro F1。"""
-    score = _fog_class_f1(y_true, y_pred)
-    if np.isnan(score):
-        score = f1_score(y_true, y_pred, average="macro", zero_division=0)
-    return score
-
-
 def _choose_blend_weight(rf, xgb, X_val, y_val):
     """検証期間で最も成績の良い混合比（RandomForest側の重み）を選ぶ。
 
@@ -1599,6 +1880,101 @@ def _choose_blend_weight(rf, xgb, X_val, y_val):
         if score > best_score:
             best_w, best_score = w, score
     return best_w, scores
+
+
+def _choose_fog_threshold(pipe, X_val, y_val):
+    """検証期間で、霧確率がこの値以上なら「霧」と判定するしきい値を選ぶ。
+
+    予測現象コード自体（predict()の中身）は変えない。あくまで④のグラフの目安線や
+    ⑥CSVの「判定」列で使う、霧確率に対する二値判定のしきい値だけを最適化する。
+    検証期間に霧が無い（or 常に霧）ときは、判定のしようがないので既定の50%のままにする。
+    """
+    if len(X_val) == 0:
+        return DEFAULT_FOG_THRESHOLD
+    y_bin = pd.Series(y_val).isin(SUMMARY_FOG_CODES).astype(int).to_numpy()
+    if y_bin.sum() == 0 or y_bin.sum() == len(y_bin):
+        return DEFAULT_FOG_THRESHOLD
+    probs = compute_fog_probability(pipe, X_val)
+    best_t, best_f1 = DEFAULT_FOG_THRESHOLD, -1.0
+    for t in FOG_THRESHOLD_GRID:
+        f1 = f1_score(y_bin, (probs >= t).astype(int), zero_division=0)
+        if f1 > best_f1:
+            best_t, best_f1 = float(t), f1
+    return best_t
+
+
+def _fit_and_select(kind, X_train, y_train, loc_name):
+    """指定モデル種別で学習し、検証期間が確保できれば混合比・霧しきい値も選ぶ。
+
+    地点ごとの学習ループと、データが少ない地点を補う「全地点共通モデル」の学習の
+    両方から使う共通処理。
+
+    戻り値: (HybridFogClassifier, tuned:bool, threshold:float, rf_pipe, xgb_pipe)
+    """
+    X_inner, X_val, y_inner, y_val = _temporal_train_test_split(X_train, y_train)
+    have_val = y_inner.nunique() >= 2 and len(X_val) >= 10
+
+    rf_pipe = xgb_pipe = None
+    if kind == "hybrid":
+        if have_val:
+            rf_tmp, rf_params, rf_tuned = _fit_component("rf", X_inner, y_inner, loc_name)
+            xgb_tmp, xgb_params, xgb_tuned = _fit_component("xgb", X_inner, y_inner, loc_name)
+            weight, _ = _choose_blend_weight(rf_tmp, xgb_tmp, X_val, y_val)
+            threshold = _choose_fog_threshold(HybridFogClassifier(rf_tmp, xgb_tmp, weight), X_val, y_val)
+            # 比率としきい値が決まったら、検証期間も含めた学習データ全体で学習し直す
+            # （探索はしないので追加の計算コストは小さい）。
+            rf_pipe = _refit_component("rf", rf_params, X_train, y_train)
+            xgb_pipe = _refit_component("xgb", xgb_params, X_train, y_train)
+            tuned = rf_tuned and xgb_tuned
+        else:
+            # 検証期間を切り出せないほど小さい地点は、比率としきい値を既定のままにする
+            rf_pipe, _, rf_tuned = _fit_component("rf", X_train, y_train, loc_name)
+            xgb_pipe, _, xgb_tuned = _fit_component("xgb", X_train, y_train, loc_name)
+            weight, tuned, threshold = 0.5, rf_tuned and xgb_tuned, DEFAULT_FOG_THRESHOLD
+    else:
+        single_kind = kind  # "rf" または "xgb"
+        weight = 1.0 if single_kind == "rf" else 0.0
+        if have_val:
+            tmp, params, s_tuned = _fit_component(single_kind, X_inner, y_inner, loc_name)
+            tmp_pipe = (HybridFogClassifier(tmp, None, weight=1.0) if single_kind == "rf"
+                       else HybridFogClassifier(None, tmp, weight=0.0))
+            threshold = _choose_fog_threshold(tmp_pipe, X_val, y_val)
+            final_pipe = _refit_component(single_kind, params, X_train, y_train)
+            tuned = s_tuned
+        else:
+            final_pipe, _, tuned = _fit_component(single_kind, X_train, y_train, loc_name)
+            threshold = DEFAULT_FOG_THRESHOLD
+        if single_kind == "rf":
+            rf_pipe = final_pipe
+        else:
+            xgb_pipe = final_pipe
+
+    pipe = HybridFogClassifier(rf_pipe, xgb_pipe, weight=weight)
+    return pipe, tuned, threshold, rf_pipe, xgb_pipe
+
+
+def _collect_location_xy(merged, col, dummy_blocks, feature_names):
+    """1地点ぶんの学習データ（実測がある行だけ・ダミー期間を除外）を取り出す。"""
+    sub = merged.dropna(subset=[col]).sort_values("datetime").reset_index(drop=True)
+    for start, end, _, _ in dummy_blocks.get(col, []):
+        sub = sub[(sub["datetime"] < start) | (sub["datetime"] > end)]
+    sub = sub.reset_index(drop=True)
+    return sub, sub[feature_names], sub[col].astype(int)
+
+
+def _top_feature_importances(rf_pipe, xgb_pipe, weight, feature_names, top_n=3):
+    """学習済みモデルで重要度の高かった特徴量を上位から返す（`[(名前, 重要度), ...]`）。
+
+    ハイブリッドの場合はRF/XGBの重要度を混合比で加重平均する
+    （どちらも同じ feature_names の並びで学習しているため、そのまま足せる）。
+    """
+    imps = np.zeros(len(feature_names))
+    if rf_pipe is not None:
+        imps = imps + weight * rf_pipe.named_steps["model"].feature_importances_
+    if xgb_pipe is not None:
+        imps = imps + (1 - weight) * xgb_pipe.named_steps["model"].model_.feature_importances_
+    order = np.argsort(imps)[::-1][:top_n]
+    return [(feature_names[i], float(imps[i])) for i in order]
 
 
 def _resolve_model_kind(model):
@@ -1621,11 +1997,15 @@ def train_location_models(main_df, phenom_df, phenom_cols, location_mapping,
     予測確率を地点ごとの最適な比率で混ぜ合わせる（`HybridFogClassifier`）。
     model="rf" / "xgb" ならその片方だけを使う。
 
+    個別の学習条件（`MIN_ROWS_PER_LOCATION`件・`MIN_CLASSES_PER_LOCATION`種類）を
+    満たさない地点は、条件を満たす地点も含めた全地点共通のデータで学習した
+    「共通モデル」で補う（`model_type` が "pooled(...)" になる）。
+
     戻り値: {列文字: {"pipe": HybridFogClassifier, "accuracy": float, "f1": float,
                       "fog_f1": float, "n": int, "n_classes": int, "classes": list,
                       "features": list, "model_type": str, "blend_weight": float,
-                      "rf_fog_f1": float, "xgb_fog_f1": float}}
-    （学習条件を満たさない地点は辞書に含めない＝その地点の予測グラフは作られない）
+                      "fog_threshold": float, "rf_fog_f1": float, "xgb_fog_f1": float,
+                      "pooled": bool}}
     """
     targets = build_location_class_targets(phenom_df, phenom_cols)
     merged = pd.merge(main_df, targets, on="datetime", how="inner")
@@ -1657,75 +2037,36 @@ def train_location_models(main_df, phenom_df, phenom_cols, location_mapping,
             print(f"  ⚠ {w}")
 
     print()
-    print(f"{'地点名':<16} {'件数':>7} {'クラス数':>8} {'正解率':>7} {'F1':>6} {'霧F1':>6} "
-          f"{'採用モデル':>14}  結果")
-    print("-" * 88)
-
+    progress = _ProgressBar(len(phenom_cols), prefix="地点ごとの学習")
     models = {}
+    learned_rows = []   # 表示用: (loc_name, n, n_classes, acc, f1, fog_f1, desc, threshold, tag)
+    skipped_rows = []   # 表示用: (loc_name, n, reason)
     for col in phenom_cols:
         loc_name = location_mapping.get(col, col)
-        sub = merged.dropna(subset=[col]).sort_values("datetime").reset_index(drop=True)
-
-        # ダミーと判定されたブロックの期間を学習データから除外する
-        n_before_dummy = len(sub)
-        for start, end, _, _ in dummy_blocks_by_col.get(col, []):
-            sub = sub[(sub["datetime"] < start) | (sub["datetime"] > end)]
+        progress.update(1, suffix=loc_name)
+        sub, X, y = _collect_location_xy(merged, col, dummy_blocks_by_col, feature_names)
 
         if len(sub) < MIN_ROWS_PER_LOCATION:
-            reason = ("ダミー判定で全期間を除外" if n_before_dummy and len(sub) == 0
-                      else "データ不足でスキップ")
-            print(f"{loc_name:<16} {len(sub):>7} {'-':>8} {'-':>7} {'-':>6} {'-':>6} "
-                  f"{'-':>14}  {reason}")
+            reason = "ダミー判定で全期間を除外" if len(sub) == 0 else "データ不足でスキップ"
+            skipped_rows.append((loc_name, len(sub), reason))
             continue
 
-        y = sub[col].astype(int)
-        class_counts = y.value_counts()
-        n_classes = len(class_counts)
+        n_classes = y.nunique()
         if n_classes < MIN_CLASSES_PER_LOCATION:
-            print(f"{loc_name:<16} {len(sub):>7} {n_classes:>8} {'-':>7} {'-':>6} {'-':>6} "
-                  f"{'-':>14}  現象の種類が少なくスキップ")
+            skipped_rows.append((loc_name, len(sub), "現象の種類が少なくスキップ"))
             continue
 
-        X = sub[feature_names]
         X_train, X_test, y_train, y_test = _temporal_train_test_split(X, y)
-
         if y_train.nunique() < 2:
-            print(f"{loc_name:<16} {len(sub):>7} {n_classes:>8} {'-':>7} {'-':>6} {'-':>6} "
-                  f"{'-':>14}  分割後クラス不足でスキップ")
+            skipped_rows.append((loc_name, len(sub), "分割後クラス不足でスキップ"))
             continue
 
-        rf_pipe = xgb_pipe = None
-        weight = 1.0
-        if kind == "hybrid":
-            # 混合比は「学習データのさらに後ろ20%（＝検証期間）」だけで決める。
-            # 評価用のテスト期間には一切触らないので、最終スコアが甘くならない。
-            X_inner, X_val, y_inner, y_val = _temporal_train_test_split(X_train, y_train)
-            if y_inner.nunique() >= 2 and len(X_val) >= 10:
-                rf_tmp, rf_params, rf_tuned = _fit_component("rf", X_inner, y_inner, loc_name)
-                xgb_tmp, xgb_params, xgb_tuned = _fit_component("xgb", X_inner, y_inner, loc_name)
-                weight, _ = _choose_blend_weight(rf_tmp, xgb_tmp, X_val, y_val)
-                # 比率が決まったら、検証期間も含めた学習データ全体で学習し直す
-                # （探索はしないので追加の計算コストは小さい）。
-                rf_pipe = _refit_component("rf", rf_params, X_train, y_train)
-                xgb_pipe = _refit_component("xgb", xgb_params, X_train, y_train)
-                tuned = rf_tuned and xgb_tuned
-            else:
-                # 検証期間を切り出せないほど小さい地点は、比率を半々に固定する
-                rf_pipe, _, rf_tuned = _fit_component("rf", X_train, y_train, loc_name)
-                xgb_pipe, _, xgb_tuned = _fit_component("xgb", X_train, y_train, loc_name)
-                weight, tuned = 0.5, rf_tuned and xgb_tuned
-        elif kind == "rf":
-            rf_pipe, _, tuned = _fit_component("rf", X_train, y_train, loc_name)
-        else:
-            xgb_pipe, _, tuned = _fit_component("xgb", X_train, y_train, loc_name)
-
-        pipe = HybridFogClassifier(rf_pipe, xgb_pipe, weight=weight)
+        pipe, tuned, threshold, rf_pipe, xgb_pipe = _fit_and_select(kind, X_train, y_train, loc_name)
 
         y_pred = pipe.predict(X_test)
         acc = accuracy_score(y_test, y_pred)
         f1 = f1_score(y_test, y_pred, average="weighted", zero_division=0)
         fog_f1 = _fog_class_f1(y_test, y_pred)
-        fog_f1_str = f"{fog_f1:>6.3f}" if not np.isnan(fog_f1) else f"{'-':>6}"
         # 「ハイブリッドにして本当に良くなったのか」を利用者が確かめられるよう、
         # 混ぜる前のRandomForest単独・XGBoost単独の霧F1も同じテスト期間で測っておく。
         rf_fog_f1 = _fog_class_f1(y_test, rf_pipe.predict(X_test)) if rf_pipe is not None else np.nan
@@ -1734,25 +2075,28 @@ def train_location_models(main_df, phenom_df, phenom_cols, location_mapping,
         # テスト期間に現象が1種類しかない場合、正解率は「常に多数派を答える」だけで
         # 100%になってしまう。数字を鵜呑みにしないよう、その旨をここで明示する。
         eval_trivial = y_test.nunique() < 2
-        tag = "学習完了(調整済)" if tuned else "学習完了(既定値)"
+        tag = "調整済" if tuned else "既定値"
         if eval_trivial:
-            tag += " ※評価期間に現象1種のみ＝正解率は参考値"
-        print(f"{loc_name:<16} {len(sub):>7} {n_classes:>8} {acc:>7.1%} {f1:>6.3f} {fog_f1_str} "
-              f"{pipe.describe():>14}  {tag}")
+            tag += "・評価期間に現象1種のみ＝正解率は参考値"
+        learned_rows.append((loc_name, len(sub), n_classes, acc, f1, fog_f1, pipe.describe(),
+                             threshold, tag))
         models[col] = {
             "pipe": pipe, "accuracy": acc, "f1": f1, "fog_f1": fog_f1,
             "n": len(sub), "n_classes": n_classes, "classes": sorted(y.unique().tolist()),
             "features": feature_names, "eval_trivial": eval_trivial,
             "model_type": pipe.model_type, "blend_weight": pipe.weight,
-            "rf_fog_f1": rf_fog_f1, "xgb_fog_f1": xgb_fog_f1,
+            "fog_threshold": threshold, "rf_fog_f1": rf_fog_f1, "xgb_fog_f1": xgb_fog_f1,
+            "pooled": False, "rf_pipe": rf_pipe, "xgb_pipe": xgb_pipe, "loc_name": loc_name,
         }
+    progress.close()
+
+    _print_training_table(learned_rows, skipped_rows, len(phenom_cols))
 
     if models:
         accs = [m["accuracy"] for m in models.values()]
         scored = [m for m in models.values() if not np.isnan(m["fog_f1"])]
         fog_f1s = [m["fog_f1"] for m in scored]
-        print("-" * 88)
-        print(f"学習できた地点数: {len(models)} / {len(phenom_cols)}　平均正解率: {np.mean(accs):.1%}", end="")
+        print(f"\n学習できた地点数: {len(models)} / {len(phenom_cols)}　平均正解率: {np.mean(accs):.1%}", end="")
         if fog_f1s:
             print(f"　平均霧F1: {np.mean(fog_f1s):.3f}")
         else:
@@ -1764,10 +2108,183 @@ def train_location_models(main_df, phenom_df, phenom_cols, location_mapping,
             print(f"　平均霧F1の内訳 → RandomForest単独: {rf_only:.3f} / XGBoost単独: {xgb_only:.3f}"
                   f" / ハイブリッド: {np.mean(fog_f1s):.3f}（{len(scored)}地点で比較）")
         print("※ 正解率は「/」（現象なし）が大多数だと高く出ます。霧の当たり具合は霧F1で確認してください。")
+        _print_top_features(models, feature_names)
     else:
         print("\n【警告】どの地点も学習条件を満たさず、モデルを1つも作れませんでした。")
 
+    _rescue_with_pooled_model(models, merged, phenom_cols, location_mapping,
+                              dummy_blocks_by_col, feature_names, kind)
+
+    for m in models.values():
+        m.pop("rf_pipe", None)
+        m.pop("xgb_pipe", None)
     return models
+
+
+def _print_training_table(learned_rows, skipped_rows, n_total):
+    """学習できた地点の表と、スキップした地点の要約を分けて表示する。
+
+    以前は「学習できた地点」と「スキップした地点」を同じ表に混ぜ、地点名の表示幅も
+    文字数基準で揃えていたため、全角文字数の違う地点名が並ぶと桁がずれていた。
+    `_pad()`（表示幅基準）で揃え、見やすさのために2つの表に分ける。
+    """
+    name_w = max([12] + [_disp_width(r[0]) for r in learned_rows + skipped_rows])
+
+    if learned_rows:
+        print(f"【学習できた地点】 {len(learned_rows)} / {n_total}地点")
+        header = (f"  {_pad('地点名', name_w)} {_pad('件数', 7, '>')} {_pad('クラス数', 8, '>')} "
+                  f"{_pad('正解率', 7, '>')} {_pad('F1', 6, '>')} {_pad('霧F1', 6, '>')} "
+                  f"{_pad('霧判定閾値', 10, '>')}  採用モデル")
+        print(header)
+        print("  " + "-" * (_disp_width(header) - 2))
+        for loc_name, n, n_classes, acc, f1, fog_f1, desc, threshold, tag in learned_rows:
+            fog_f1_str = f"{fog_f1:.3f}" if not np.isnan(fog_f1) else "-"
+            print(f"  {_pad(loc_name, name_w)} {n:>7} {n_classes:>8} {acc:>7.1%} {f1:>6.3f} "
+                  f"{_pad(fog_f1_str, 6, '>')} {_pad(f'{threshold:.0%}', 10, '>')}  {desc}（{tag}）")
+
+    if skipped_rows:
+        print(f"\n【スキップした地点】 {len(skipped_rows)} / {n_total}地点"
+              "（後述の「共通モデル」で補えるか確認します）")
+        by_reason = {}
+        for loc_name, n, reason in skipped_rows:
+            by_reason.setdefault(reason, []).append((loc_name, n))
+        for reason, items in by_reason.items():
+            names = "、".join(f"{name}({n}件)" for name, n in items)
+            print(f"  {reason}（{len(items)}地点）: {names}")
+
+
+def _print_top_features(models, feature_names):
+    """地点ごとに効いている特徴量の上位3つを表示する（予測を信じてよいかの参考情報）。"""
+    real_models = {col: m for col, m in models.items() if not m.get("pooled")}
+    if not real_models:
+        return
+    print("\n【参考】地点ごとに効いている特徴量トップ3（重要度）:")
+    name_w = max(_disp_width(m.get("loc_name", col)) for col, m in real_models.items())
+    for col, m in real_models.items():
+        top = _top_feature_importances(m.get("rf_pipe"), m.get("xgb_pipe"), m["blend_weight"],
+                                       feature_names)
+        text = "  ".join(f"{name}({imp:.2f})" for name, imp in top)
+        loc_name = m.get("loc_name", col)
+        print(f"  {_pad(loc_name, name_w)}  {text}")
+
+
+def _rescue_with_pooled_model(models, merged, phenom_cols, location_mapping,
+                              dummy_blocks_by_col, feature_names, kind):
+    """個別の学習条件を満たさなかった地点を、全地点共通のデータで学習したモデルで補う。
+
+    只見川流域の32地点は同じ気象条件の影響を受けるため、データが少ない地点でも
+    「気象条件と現象コードの関係」自体は他地点からある程度借りられる、という考え方。
+    共通モデルは地点を区別しない（同じ気象条件なら同じ予測になる）ため、
+    地点固有の霧の出やすさまでは学習できない点には注意（README参照）。
+    """
+    skipped_cols = [c for c in phenom_cols if c not in models]
+    if not skipped_cols:
+        return
+
+    pool_frames = []
+    for col in phenom_cols:
+        sub, X, y = _collect_location_xy(merged, col, dummy_blocks_by_col, feature_names)
+        if sub.empty:
+            continue
+        part = X.copy()
+        part["__target"] = y.to_numpy()
+        part["__datetime"] = sub["datetime"].to_numpy()
+        pool_frames.append(part)
+
+    if not pool_frames:
+        return
+    pooled = pd.concat(pool_frames, ignore_index=True).sort_values("__datetime").reset_index(drop=True)
+    if len(pooled) < MIN_TOTAL_ROWS_FOR_POOLING or pooled["__target"].nunique() < 2:
+        print(f"\n【共通モデル】データ不足の{len(skipped_cols)}地点がありますが、"
+              f"全地点を合わせても学習データが少なく（{len(pooled)}件）、共通モデルも作れませんでした。")
+        return
+
+    Xp, yp = pooled[feature_names], pooled["__target"]
+    Xp_train, Xp_test, yp_train, yp_test = _temporal_train_test_split(Xp, yp)
+    if yp_train.nunique() < 2:
+        return
+
+    print("\n" + "-" * 66)
+    print(f"■ データ不足の{len(skipped_cols)}地点を「全地点共通モデル」で補います"
+          f"（学習に使う合計件数: {len(pooled)}件、{MODEL_KIND_LABELS[kind]}）")
+    pooled_pipe, pooled_tuned, pooled_threshold, *_ = _fit_and_select(kind, Xp_train, yp_train, "共通モデル")
+
+    rescued = []
+    for col in skipped_cols:
+        sub, X, y = _collect_location_xy(merged, col, dummy_blocks_by_col, feature_names)
+        if len(sub) < MIN_ROWS_FOR_POOLED_RESCUE or y.nunique() < 2:
+            continue
+        X_train2, X_test2, y_train2, y_test2 = _temporal_train_test_split(X, y)
+        if len(X_test2) == 0:
+            continue
+        y_pred2 = pooled_pipe.predict(X_test2)
+        acc2 = accuracy_score(y_test2, y_pred2)
+        f12 = f1_score(y_test2, y_pred2, average="weighted", zero_division=0)
+        fog_f12 = _fog_class_f1(y_test2, y_pred2)
+        loc_name = location_mapping.get(col, col)
+        models[col] = {
+            "pipe": pooled_pipe, "accuracy": acc2, "f1": f12, "fog_f1": fog_f12,
+            "n": len(sub), "n_classes": int(y.nunique()), "classes": sorted(y.unique().tolist()),
+            "features": feature_names, "eval_trivial": y_test2.nunique() < 2,
+            "model_type": f"pooled({pooled_pipe.model_type})", "blend_weight": pooled_pipe.weight,
+            "fog_threshold": pooled_threshold, "rf_fog_f1": np.nan, "xgb_fog_f1": np.nan,
+            "pooled": True, "loc_name": loc_name,
+        }
+        rescued.append((loc_name, len(sub), fog_f12))
+
+    if rescued:
+        name_w = max(_disp_width(n) for n, _, _ in rescued)
+        print(f"  共通モデルで学習できた地点: {len(rescued)}地点"
+              f"（{'調整済' if pooled_tuned else '既定値'}、霧判定閾値={pooled_threshold:.0%}）")
+        for loc_name, n, fog_f12 in rescued:
+            fog_f1_str = f"{fog_f12:.3f}" if not np.isnan(fog_f12) else "-"
+            print(f"    {_pad(loc_name, name_w)} {n:>6}件  霧F1={fog_f1_str}")
+        print("  ※ 共通モデルは地点を区別しないため、地点固有の霧の出やすさは反映されません。"
+              "参考程度に確認してください。")
+    else:
+        print("  共通モデルで評価できるほどのデータがある地点は、他にありませんでした。")
+
+
+# Open-Meteoの変数名 → 学習データと同じ列名・単位への変換。
+# 任意項目（日照時間・気圧・日射量・視程）も常にまとめて取得しておき、学習データ側に
+# その項目が実際にあった地点だけ特徴量として使う（`select_feature_names()` が判定）。
+#   sunshine_duration   : 秒 → 時間（÷3600）
+#   shortwave_radiation : W/m²（1時間平均）→ MJ/m²（×0.0036）
+#   visibility          : m → km（÷1000）
+#   surface_pressure    : hPa（変換不要）
+_FORECAST_VARS = {
+    "temperature_2m": ("気温(℃)", None),
+    "precipitation": ("降水量(mm)", None),
+    "relative_humidity_2m": ("相対湿度(％)", None),
+    "dew_point_2m": ("露点温度(℃)", None),
+    "wind_speed_10m": ("風速(m/s)", None),
+    "wind_direction_10m": (WIND_DIR_LABEL, None),
+    "sunshine_duration": ("日照時間(時間)", lambda v: v / 3600.0),
+    "surface_pressure": ("気圧(hPa)", None),
+    "shortwave_radiation": ("日射量(MJ/m2)", lambda v: v * 0.0036),
+    "visibility": ("視程(km)", lambda v: v / 1000.0),
+}
+
+
+def _forecast_payload_to_df(hourly: dict) -> pd.DataFrame:
+    """Open-Meteoの `hourly` ブロック1つを、学習データと同じ列名のDataFrameに変換する。"""
+    data = {"datetime": pd.to_datetime(hourly["time"])}
+    for var, (label, convert) in _FORECAST_VARS.items():
+        if var not in hourly:
+            continue
+        values = pd.to_numeric(pd.Series(hourly[var]), errors="coerce")
+        data[label] = convert(values) if convert else values
+    df = pd.DataFrame(data)
+    if "降水量(mm)" in df.columns:
+        df["降水量(mm)"] = df["降水量(mm)"].fillna(0.0)
+
+    # 予報値に欠測が混じっているとモデルが例外を出すため、時間方向に補間して埋める
+    numeric_cols = [c for c in df.columns if c != "datetime"]
+    df[numeric_cols] = df[numeric_cols].interpolate(limit_direction="both")
+    df = df.dropna(subset=["気温(℃)", "相対湿度(％)", "露点温度(℃)", "風速(m/s)"]).reset_index(drop=True)
+    if df.empty:
+        raise ValueError("Open-Meteoから有効な予報値を取得できませんでした。")
+    return df
 
 
 def fetch_forecast_range(lat: float = None, lon: float = None, forecast_days: int = None):
@@ -1784,8 +2301,7 @@ def fetch_forecast_range(lat: float = None, lon: float = None, forecast_days: in
     params = {
         "latitude": lat,
         "longitude": lon,
-        "hourly": ("temperature_2m,precipitation,relative_humidity_2m,"
-                   "dew_point_2m,wind_speed_10m,wind_direction_10m"),
+        "hourly": ",".join(_FORECAST_VARS.keys()),
         "timezone": "Asia/Tokyo",
         "forecast_days": forecast_days,
         "wind_speed_unit": "ms",      # 気象庁データ（m/s）に合わせる
@@ -1797,43 +2313,85 @@ def fetch_forecast_range(lat: float = None, lon: float = None, forecast_days: in
     payload = resp.json()
     if "hourly" not in payload:
         raise ValueError(f"Open-Meteoの応答に hourly が含まれていません: {payload}")
-    data = payload["hourly"]
-
-    df = pd.DataFrame({
-        "datetime": pd.to_datetime(data["time"]),
-        "気温(℃)": data["temperature_2m"],
-        "降水量(mm)": data["precipitation"],
-        "相対湿度(％)": data["relative_humidity_2m"],
-        "露点温度(℃)": data["dew_point_2m"],
-        "風速(m/s)": data["wind_speed_10m"],
-        WIND_DIR_LABEL: data.get("wind_direction_10m"),
-    })
-    for col in df.columns:
-        if col != "datetime":
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["降水量(mm)"] = df["降水量(mm)"].fillna(0.0)
-
-    # 予報値に欠測が混じっているとモデルが例外を出すため、時間方向に補間して埋める
-    numeric_cols = [c for c in df.columns if c != "datetime"]
-    df[numeric_cols] = df[numeric_cols].interpolate(limit_direction="both")
-    df = df.dropna(subset=["気温(℃)", "相対湿度(％)", "露点温度(℃)", "風速(m/s)"]).reset_index(drop=True)
-    if df.empty:
-        raise ValueError("Open-Meteoから有効な予報値を取得できませんでした。")
-    return df
+    return _forecast_payload_to_df(payload["hourly"])
 
 
-def build_location_forecast_codes(models, forecast_raw):
+def load_location_coordinates(filepath):
+    """『地点名,緯度,経度』形式のCSVを読み、{地点名: (緯度, 経度)} を返す。
+
+    地点ごとに予報を取得したいときに使う（既定は全地点で1地点分の予報を共用している）。
+    列名は「地点」「緯度」「経度」を含んでいれば順不同で構わない。
+    """
+    df = pd.read_csv(filepath)
+    df.columns = [str(c).strip() for c in df.columns]
+    name_col = next((c for c in df.columns if "地点" in c or "name" in c.lower()), df.columns[0])
+    lat_col = next((c for c in df.columns if "緯度" in c or "lat" in c.lower()), None)
+    lon_col = next((c for c in df.columns if "経度" in c or "lon" in c.lower()), None)
+    if lat_col is None or lon_col is None:
+        raise ValueError(
+            "緯度・経度の列が見つかりません。列名に「緯度」「経度」を含む列を用意してください"
+            "（例: 地点名,緯度,経度）。"
+        )
+    coords = {}
+    for _, row in df.iterrows():
+        name = str(row[name_col]).strip()
+        try:
+            coords[name] = (float(row[lat_col]), float(row[lon_col]))
+        except (TypeError, ValueError):
+            continue
+    return coords
+
+
+def fetch_forecast_multi(coords: dict, forecast_days: int = None):
+    """複数地点の予報を1回のリクエストでまとめて取得する（Open-Meteoの緯度経度カンマ区切り機能）。
+
+    戻り値: {地点名: 予報DataFrame}（`fetch_forecast_range()` と同じ列構成）
+    """
+    if not coords:
+        return {}
+    forecast_days = FORECAST_DAYS if forecast_days is None else forecast_days
+    names = list(coords.keys())
+    params = {
+        "latitude": ",".join(str(coords[n][0]) for n in names),
+        "longitude": ",".join(str(coords[n][1]) for n in names),
+        "hourly": ",".join(_FORECAST_VARS.keys()),
+        "timezone": "Asia/Tokyo",
+        "forecast_days": forecast_days,
+        "wind_speed_unit": "ms",
+        "precipitation_unit": "mm",
+        "temperature_unit": "celsius",
+    }
+    resp = requests.get(OPEN_METEO_URL, params=params, timeout=30)
+    resp.raise_for_status()
+    payload = resp.json()
+    # 1地点だけのときはdict、複数地点のときはlistで返ってくる（Open-Meteoの仕様）
+    items = [payload] if isinstance(payload, dict) else payload
+    result = {}
+    for name, item in zip(names, items):
+        if "hourly" not in item:
+            continue
+        result[name] = _forecast_payload_to_df(item["hourly"])
+    return result
+
+
+def build_location_forecast_codes(models, forecast_raw, forecast_by_col: dict = None):
     """予報データに対して、地点ごとに現象コードと霧確率を予測する。
+
+    forecast_by_col を渡すと、その列だけは対応する専用の予報（地点ごとの緯度経度で
+    取得したもの）を使う。渡されない／該当が無い地点は forecast_raw（既定の1地点分の予報）
+    を使う。
 
     戻り値: (pred_df, prob_df)
       pred_df : datetime列 + 各地点の予測コード（0〜10）
       prob_df : datetime列 + 各地点の霧（コード1〜6）確率（0〜1）
     """
+    forecast_by_col = forecast_by_col or {}
     pred_df = pd.DataFrame({"datetime": forecast_raw["datetime"].values})
     prob_df = pd.DataFrame({"datetime": forecast_raw["datetime"].values})
     for col, info in models.items():
-        feature_names = info.get("features") or select_feature_names(forecast_raw)
-        df, feature_names = prepare_features(forecast_raw, feature_names)
+        raw = forecast_by_col.get(col, forecast_raw)
+        feature_names = info.get("features") or select_feature_names(raw)
+        df, feature_names = prepare_features(raw, feature_names)
         X = df[feature_names]
         pred_df[col] = info["pipe"].predict(X).astype(int)
         prob_df[col] = compute_fog_probability(info["pipe"], X)
@@ -1910,7 +2468,8 @@ def _draw_axis_break_marks(ax_left, ax_right):
 
 def plot_single_location_forecast(main_df, phenom_df, col, location_mapping,
                                   forecast_raw, pred_series, location_name, out_dir,
-                                  history_days: int = 5, prob_series=None):
+                                  history_days: int = 5, prob_series=None,
+                                  fog_threshold: float = DEFAULT_FOG_THRESHOLD):
     """1地点だけの「実測（直近history_days日）＋ 今後の予測」グラフを作る。
 
     上段  : 気温・露点・湿度（実測＝実線／予報＝点線、色は実測と同じ）
@@ -1995,11 +2554,16 @@ def plot_single_location_forecast(main_df, phenom_df, col, location_mapping,
         ax1r.set_ylim(0, 115)
 
         # ーーー 中段：霧（コード1〜6）の予測確率 ーーー
+        # 目安線は固定50%ではなく、地点ごとに検証期間で最適化したしきい値を使う
+        # （`fog_threshold`。地点によって霧の出やすさ・データの偏りが違うため、
+        # 一律50%だと見逃しや誤警戒が多くなる地点があった）。
+        threshold_pct = fog_threshold * 100.0
         if probs is not None:
             axp.fill_between(forecast_raw["datetime"], 0, probs, color="#2980b9", alpha=0.30, zorder=2)
             axp.plot(forecast_raw["datetime"], probs, color="#1a5276", linewidth=1.4, zorder=3,
                      label="霧(1〜6)の予測確率")
-            axp.axhline(50, color="#c0392b", linewidth=0.8, linestyle="--", alpha=0.7, zorder=1)
+            axp.axhline(threshold_pct, color="#c0392b", linewidth=0.9, linestyle="--", alpha=0.8, zorder=1,
+                       label=f"霧警戒ライン（{threshold_pct:.0f}%・地点ごとに最適化）")
         axp.set_ylim(0, 100)
         axp.set_yticks([0, 50, 100])
         axp.grid(True, axis="y", alpha=0.25)
@@ -2050,13 +2614,15 @@ def plot_single_location_forecast(main_df, phenom_df, col, location_mapping,
         elif len(segments) > 1:
             ax1.set_title("実測", loc="left", fontsize=9, color="dimgray")
 
-    # 凡例は右端のパネルにまとめて出す（各パネルに出すと図が読みにくくなるため）
+    # 凡例は右端のパネルにまとめて出す（各パネルに出すと図が読みにくくなるため）。
+    # 上段はグラフ内に置くと線と重なって読みにくくなるため、パネルの外（上）に横並びで出す。
     ax1_last, axp_last, ax2_last = axes[0][-1], axes[1][-1], axes[2][-1]
-    h1, lbl1 = ax1_last.get_legend_handles_labels()
-    h2, lbl2 = humid_axes[-1].get_legend_handles_labels()
-    ax1_last.legend(h1 + h2, lbl1 + lbl2, loc="upper left", fontsize=8)
+    h1, lbl1 = axes[0][0].get_legend_handles_labels()
+    h2, lbl2 = humid_axes[0].get_legend_handles_labels()
+    axes[0][0].legend(h1 + h2, lbl1 + lbl2, bbox_to_anchor=(0, 1.02, 1, 0.12), loc="lower left",
+                      ncol=3, mode="expand", borderaxespad=0., fontsize=7.5)
     if probs is not None:
-        axp_last.legend(loc="upper left", fontsize=8)
+        axp_last.legend(loc="upper left", fontsize=7.5)
     ax2_last.legend(handles=_phenom_legend_handles(), bbox_to_anchor=(1.08, 2.6), loc="upper left",
                     fontsize=7, borderaxespad=0., title="現象コード", title_fontsize=8)
 
@@ -2087,54 +2653,87 @@ def plot_single_location_forecast(main_df, phenom_df, col, location_mapping,
 
 
 def plot_all_location_summary(pred_df, models, location_mapping, location_name, out_dir, prob_df=None):
-    """全地点の予測をまとめ、日ごとに『霧(コード1〜6)が予測された地点数』を棒グラフにする。
-    あわせて、その日の霧確率の平均（全地点・全時刻）を折れ線で重ねる。
+    """全地点の予測をまとめる。
+
+    上段: 日ごとに『霧(コード1〜6)が予測された地点数』の棒グラフ（＋霧確率の全地点平均の折れ線）。
+    下段: 地点×日で「その日の霧確率の最大」を色の濃さで示すヒートマップ。
+          どの地点がいつ危ないかを一覧できるようにするための追加パネル
+          （以前は上段の棒グラフだけで、地点ごとの違いが見えなかった）。
     """
     df = pred_df.copy()
     df["date"] = df["datetime"].dt.date
     fog_cols = [c for c in models.keys() if c in df.columns]
     n_total = len(fog_cols)
+    loc_names = [location_mapping.get(c, c) for c in fog_cols]
 
-    dates, counts, mean_probs = [], [], []
-    for d, group in df.groupby("date"):
-        count = sum(1 for col in fog_cols if group[col].astype(int).isin(SUMMARY_FOG_CODES).any())
-        dates.append(d)
-        counts.append(count)
+    dates = sorted(df["date"].unique())
+    n_days = len(dates)
+    counts, mean_probs = [], []
+    prob_dates = prob_df["datetime"].dt.date if prob_df is not None else None
+    for d in dates:
+        group = df[df["date"] == d]
+        counts.append(sum(1 for col in fog_cols if group[col].astype(int).isin(SUMMARY_FOG_CODES).any()))
         if prob_df is not None and fog_cols:
-            mask = prob_df["datetime"].dt.date == d
-            mean_probs.append(float(prob_df.loc[mask, fog_cols].to_numpy().mean() * 100.0))
+            mask = prob_dates == d
+            mean_probs.append(float(prob_df.loc[mask, fog_cols].to_numpy().mean() * 100.0) if mask.any()
+                              else np.nan)
         else:
             mean_probs.append(np.nan)
 
-    fig, ax = plt.subplots(figsize=(max(10, len(dates) * 0.8), 5))
-    bars = ax.bar(dates, counts, color="#3498db", width=0.6, label="霧が予測された地点数")
-    for bar, c in zip(bars, counts):
-        ax.text(bar.get_x() + bar.get_width() / 2, c + 0.3, str(c), ha="center", va="bottom", fontsize=9)
+    # 地点×日の「その日の霧確率の最大」を格子状に並べる
+    heat = np.full((n_total, n_days), np.nan)
+    if prob_df is not None:
+        for i, col in enumerate(fog_cols):
+            for j, d in enumerate(dates):
+                mask = prob_dates == d
+                if mask.any():
+                    heat[i, j] = float(prob_df.loc[mask, col].max() * 100.0)
 
-    ax.set_ylim(0, n_total + 1)
-    ax.yaxis.set_major_locator(mticker.MaxNLocator(integer=True))  # 地点数なので目盛りは整数だけ
-    ax.set_ylabel(f"霧(コード1〜6)が予測された地点数（全{n_total}地点中）", fontsize=10)
-    ax.set_xlabel("日付")
-    ax.set_title(f"【{location_name}】日ごとの霧予測サマリー（今後{len(dates)}日間）", fontsize=13)
-    ax.grid(True, axis="y", alpha=0.3)
+    x = np.arange(n_days)
+    fig_w = max(10, n_days * 0.8)
+    fig_h = 3.0 + max(2.0, n_total * 0.22)
+    fig, (ax_bar, ax_heat) = plt.subplots(
+        2, 1, figsize=(fig_w, fig_h), sharex=True,
+        gridspec_kw={"height_ratios": [3.0, max(2.0, n_total * 0.22)], "hspace": 0.08},
+    )
 
-    handles, labels = ax.get_legend_handles_labels()
+    bars = ax_bar.bar(x, counts, color="#3498db", width=0.6, label="霧が予測された地点数")
+    for bx, c in zip(x, counts):
+        ax_bar.text(bx, c + 0.3, str(c), ha="center", va="bottom", fontsize=9)
+    ax_bar.set_ylim(0, n_total + 1)
+    ax_bar.yaxis.set_major_locator(mticker.MaxNLocator(integer=True))  # 地点数なので目盛りは整数だけ
+    ax_bar.set_ylabel(f"霧が予測された\n地点数（全{n_total}中）", fontsize=9)
+    ax_bar.set_title(f"【{location_name}】日ごとの霧予測サマリー（今後{n_days}日間）", fontsize=13)
+    ax_bar.grid(True, axis="y", alpha=0.3)
+
+    handles, labels = ax_bar.get_legend_handles_labels()
     if prob_df is not None and not all(np.isnan(mean_probs)):
-        axr = ax.twinx()
-        line, = axr.plot(dates, mean_probs, color="#c0392b", marker="o", markersize=4, linewidth=1.4,
+        axr = ax_bar.twinx()
+        line, = axr.plot(x, mean_probs, color="#c0392b", marker="o", markersize=4, linewidth=1.4,
                          label="霧確率の平均（全地点・全時刻）")
         axr.set_ylim(0, 100)
-        axr.set_ylabel("霧確率の平均（％）", fontsize=10)
+        axr.set_ylabel("霧確率\nの平均(%)", fontsize=9)
         handles.append(line)
         labels.append(line.get_label())
-    ax.legend(handles, labels, loc="upper left", fontsize=9)
+    ax_bar.legend(handles, labels, loc="upper left", fontsize=8)
+    ax_bar.grid(True, axis="x", alpha=0.25, linewidth=0.6)
 
-    # 各バーの真下に必ず日付ラベルが来るよう、日付を1つずつ明示的に目盛りにする
-    if dates:
-        ax.set_xticks(dates)
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y/%m/%d"))
-    ax.grid(True, axis="x", alpha=0.25, linewidth=0.6)
-    fig.autofmt_xdate()
+    # ーーー 下段：地点×日の霧確率ヒートマップ ーーー
+    im = ax_heat.imshow(heat, aspect="auto", cmap="YlOrRd", vmin=0, vmax=100, interpolation="nearest")
+    ax_heat.set_yticks(range(n_total))
+    ax_heat.set_yticklabels(loc_names, fontsize=8)
+    ax_heat.set_xticks(x)
+    ax_heat.set_xticklabels([d.strftime("%m/%d") for d in dates], fontsize=8, rotation=45, ha="right")
+    ax_heat.set_xlabel("日付")
+    ax_heat.set_ylabel("地点", fontsize=9)
+    for i in range(n_total):
+        for j in range(n_days):
+            v = heat[i, j]
+            if not np.isnan(v) and v >= 50:
+                ax_heat.text(j, i, f"{v:.0f}", ha="center", va="center", fontsize=6,
+                             color="white" if v >= 70 else "black")
+    cbar = fig.colorbar(im, ax=[ax_bar, ax_heat], fraction=0.02, pad=0.01)
+    cbar.set_label("霧確率の最大（％）", fontsize=8)
 
     stamp = dates[0].strftime("%Y%m%d") if dates else "na"
     out_path = os.path.join(out_dir, f"{location_name}_⑤日別霧予測サマリー_{stamp}.png")
@@ -2143,28 +2742,144 @@ def plot_all_location_summary(pred_df, models, location_mapping, location_name, 
     return out_path
 
 
+def _phenom_name(code: int) -> str:
+    return "現象なし" if code == 0 else PHENOM_LABELS.get(code, f"コード{code}")
+
+
 def export_prediction_csv(pred_df, prob_df, models, location_mapping, location_name, out_dir):
     """予測結果（地点ごとの予測コードと霧確率）をCSVに書き出す。
-    グラフだけでなく数値でも確認・共有できるようにするための出力。
+
+    既定は「縦持ち」形式（日時・地点・予測コード・現象名・霧確率・判定を1行ずつ並べる）。
+    地点数が多いと横持ち（従来形式、地点ごとに列が並ぶ）はExcelで延々と右にスクロールする
+    ことになるため、確認しやすい縦持ちを既定にした。横持ちも別ファイルとして両方出力する
+    （ピボット表を作りたい場合や、従来の使い方に合わせたい場合向け）。
+
+    「判定」列は、地点ごとに検証期間で最適化した霧確率のしきい値（`models[col]["fog_threshold"]`、
+    既定50%ではなく地点ごとに変わる）を超えたら「霧」とする。
     """
-    out = pd.DataFrame({"日時": pred_df["datetime"].dt.strftime("%Y/%m/%d %H:%M")})
+    long_rows = []
     for col in models.keys():
         if col not in pred_df.columns:
             continue
         name = location_mapping.get(col, col)
-        out[f"{name}_予測コード"] = pred_df[col].astype(int)
-        if prob_df is not None and col in prob_df.columns:
-            out[f"{name}_霧確率(%)"] = (prob_df[col] * 100).round(1)
+        threshold = models[col].get("fog_threshold", DEFAULT_FOG_THRESHOLD)
+        codes = pred_df[col].astype(int)
+        probs = (prob_df[col] if prob_df is not None and col in prob_df.columns
+                else pd.Series(np.nan, index=pred_df.index))
+        part = pd.DataFrame({
+            "日時": pred_df["datetime"].dt.strftime("%Y/%m/%d %H:%M"),
+            "地点": name,
+            "予測コード": codes,
+            "現象名": codes.map(_phenom_name),
+            "霧確率(%)": (probs * 100).round(1),
+            "判定": np.where(probs >= threshold, "霧", "-"),
+        })
+        long_rows.append(part)
 
     stamp = pred_df["datetime"].min().strftime("%Y%m%d")
+    long_out = pd.concat(long_rows, ignore_index=True) if long_rows else pd.DataFrame()
     out_path = os.path.join(out_dir, f"{location_name}_⑥予測結果_{stamp}.csv")
-    out.to_csv(out_path, index=False, encoding="utf-8-sig")  # Excelで開けるようBOM付き
-    return out_path
+    long_out.to_csv(out_path, index=False, encoding="utf-8-sig")  # Excelで開けるようBOM付き
+
+    # 従来形式（横持ち）も参考として出力する
+    wide = pd.DataFrame({"日時": pred_df["datetime"].dt.strftime("%Y/%m/%d %H:%M")})
+    for col in models.keys():
+        if col not in pred_df.columns:
+            continue
+        name = location_mapping.get(col, col)
+        wide[f"{name}_予測コード"] = pred_df[col].astype(int)
+        if prob_df is not None and col in prob_df.columns:
+            wide[f"{name}_霧確率(%)"] = (prob_df[col] * 100).round(1)
+    wide_path = os.path.join(out_dir, f"{location_name}_⑥予測結果_横持ち_{stamp}.csv")
+    wide.to_csv(wide_path, index=False, encoding="utf-8-sig")
+
+    return out_path, wide_path
+
+
+def load_or_train_models(main_df, phenom_df, phenom_cols, location_mapping, model, cache_path=None):
+    """`cache_path` に保存済みモデルがあれば読み込み、無ければ学習してから保存する。
+
+    グラフだけ作り直したいときに、毎回32地点分の学習をやり直さずに済ませるための機能。
+    """
+    if cache_path and os.path.isfile(cache_path):
+        try:
+            models = _joblib_load(cache_path)
+            print(f"\n■ 学習済みモデルを再利用します: {cache_path}")
+            print("  （学習をやり直したい場合は、このファイルを削除するか --model-cache に別のパスを指定してください）")
+            return models
+        except Exception as e:
+            print(f"\n【警告】保存済みモデル（{cache_path}）の読み込みに失敗したため、学習をやり直します: "
+                  f"{type(e).__name__}: {e}")
+
+    models = train_location_models(main_df, phenom_df, phenom_cols, location_mapping, model=model)
+    if cache_path and models:
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(cache_path)) or ".", exist_ok=True)
+            _joblib_dump(models, cache_path)
+            print(f"\n学習済みモデルを保存しました: {cache_path}"
+                  "（次回は --model-cache で同じファイルを指定すると学習を省略できます）")
+        except Exception as e:
+            print(f"\n【警告】学習済みモデルの保存に失敗しました: {type(e).__name__}: {e}")
+    return models
+
+
+def _fetch_per_location_forecasts(coords_file, phenom_cols, location_mapping, forecast_days, forecast_raw):
+    """`--location-coords` で指定されたCSVから、地点ごとの予報をまとめて取得する。
+
+    只見川流域の32地点は数十kmにわたって散らばっているが、既定では全地点が
+    只見町付近1地点分の予報を共用している。地点ごとの緯度経度が分かる場合は、
+    このCSVを用意すると地点ごとに実際に近い予報値で予測できる。
+
+    戻り値: {列文字: 予報DataFrame}（CSVに無い地点は空＝呼び出し側で既定の予報にフォールバックする）
+    """
+    try:
+        coords_by_name = load_location_coordinates(coords_file)
+    except (OSError, ValueError) as e:
+        print(f"\n【警告】地点座標ファイルの読み込みに失敗しました（{coords_file}）: {e}")
+        print("　→ 全地点で既定の1地点分の予報を使います。")
+        return {}
+
+    matched = {col: coords_by_name[location_mapping[col]]
+              for col in phenom_cols
+              if location_mapping.get(col) in coords_by_name}
+    if not matched:
+        print(f"\n【警告】{coords_file} の地点名が観測データの地点名と一致しませんでした。"
+              "全地点で既定の1地点分の予報を使います。")
+        return {}
+
+    print(f"\n■ 地点ごとの座標ファイルを使用: {coords_file}"
+          f"（{len(matched)}/{len(phenom_cols)}地点で個別の予報を取得）")
+    name_to_coords = {location_mapping[col]: latlon for col, latlon in matched.items()}
+    try:
+        forecasts_by_name = fetch_forecast_multi(name_to_coords, forecast_days=forecast_days)
+    except (requests.exceptions.RequestException, ValueError) as e:
+        print(f"  （地点ごとの予報取得に失敗したため、既定の1地点分の予報を使います: {e}）")
+        return {}
+
+    # pred_df/prob_dfは共通のdatetime列（forecast_rawのもの）を軸にするため、
+    # 地点ごとの予報が万一それと異なる時刻構成になっていたら、その地点だけ既定に戻す
+    # （欠測補間の結果、まれに行数がずれることがあるため）。
+    default_times = set(forecast_raw["datetime"])
+    result, mismatched = {}, []
+    for col in matched:
+        name = location_mapping[col]
+        df = forecasts_by_name.get(name)
+        if df is None:
+            continue
+        if set(df["datetime"]) != default_times:
+            mismatched.append(name)
+            continue
+        result[col] = df
+    if mismatched:
+        print(f"  （{len(mismatched)}地点は予報の時刻構成が既定と異なったため、既定の予報を使います: "
+              f"{', '.join(mismatched)}）")
+    return result
 
 
 def run_fog_prediction_addon(main_df, phenom_df, phenom_cols, location_name, out_dir, location_mapping,
                              lat: float = None, lon: float = None, forecast_days: int = None,
-                             history_days: int = 5, model=DEFAULT_MODEL_KIND):
+                             history_days: int = 5, model=DEFAULT_MODEL_KIND, model_cache=None,
+                             location_coords_file=None):
     """モデル学習 → 予報取得 → 地点ごとの予測グラフ・サマリー・CSV出力までを行う。"""
     lat = FORECAST_LAT if lat is None else lat
     lon = FORECAST_LON if lon is None else lon
@@ -2172,7 +2887,7 @@ def run_fog_prediction_addon(main_df, phenom_df, phenom_cols, location_name, out
 
     report_phenomena_quality(phenom_df, phenom_cols, location_mapping)
 
-    models = train_location_models(main_df, phenom_df, phenom_cols, location_mapping, model=model)
+    models = load_or_train_models(main_df, phenom_df, phenom_cols, location_mapping, model, model_cache)
     if not models:
         print("\n【予測モデル】1地点も学習できなかったため、予測グラフの生成をスキップしました。")
         return []
@@ -2194,30 +2909,52 @@ def run_fog_prediction_addon(main_df, phenom_df, phenom_cols, location_name, out
     print("  先頭3行:")
     print(forecast_raw.head(3).to_string(index=False))
 
-    pred_df, prob_df = build_location_forecast_codes(models, forecast_raw)
+    forecast_by_col = {}
+    if location_coords_file:
+        forecast_by_col = _fetch_per_location_forecasts(
+            location_coords_file, phenom_cols, location_mapping, forecast_days, forecast_raw)
+
+    pred_df, prob_df = build_location_forecast_codes(models, forecast_raw, forecast_by_col)
 
     generated_paths = []
-    for col in phenom_cols:
-        if col not in models:
-            continue
+    location_summaries = []
+    target_cols = [c for c in phenom_cols if c in models]
+    progress = _ProgressBar(len(target_cols), prefix="④ 地点別予測グラフ")
+    gap_warnings = []
+    for col in target_cols:
+        loc_name = location_mapping.get(col, col)
+        progress.update(1, suffix=loc_name)
+        col_forecast = forecast_by_col.get(col, forecast_raw)
 
         last_observed = get_last_observed_datetime(phenom_df, col)
-        gap_days = (forecast_raw["datetime"].min() - last_observed).total_seconds() / 86400
-        loc_name = location_mapping.get(col, col)
+        gap_days = (col_forecast["datetime"].min() - last_observed).total_seconds() / 86400
         if gap_days > 3:
-            print(f"  【注意】{loc_name}: 最後の観測記録（{last_observed.strftime('%Y/%m/%d')}）から"
-                  f"予報開始（{forecast_raw['datetime'].min().strftime('%Y/%m/%d')}）まで"
-                  f"{gap_days:.1f}日の空白があります。")
+            gap_warnings.append(
+                f"{loc_name}: 最後の観測記録（{last_observed.strftime('%Y/%m/%d')}）から"
+                f"予報開始（{col_forecast['datetime'].min().strftime('%Y/%m/%d')}）まで"
+                f"{gap_days:.1f}日の空白があります。")
 
         out_path = plot_single_location_forecast(
-            main_df, phenom_df, col, location_mapping, forecast_raw, pred_df[col],
+            main_df, phenom_df, col, location_mapping, col_forecast, pred_df[col],
             location_name, out_dir, history_days=history_days, prob_series=prob_df[col],
+            fog_threshold=models[col].get("fog_threshold", DEFAULT_FOG_THRESHOLD),
         )
         generated_paths.append(out_path)
+
         counts = pred_df[col].astype(int).value_counts().sort_index()
         breakdown = ", ".join(f"{('/' if c == 0 else c)}:{n}時間" for c, n in counts.items())
         max_prob = float(prob_df[col].max()) * 100
-        print(f"  [{loc_name}] {os.path.basename(out_path)}")
+        location_summaries.append((loc_name, os.path.basename(out_path), breakdown, max_prob))
+    progress.close()
+
+    if gap_warnings:
+        print("\n【注意】実測の最終記録から予報開始まで間が空いている地点があります:")
+        for w in gap_warnings:
+            print(f"  {w}")
+
+    print()
+    for loc_name, fname, breakdown, max_prob in location_summaries:
+        print(f"  [{loc_name}] {fname}")
         print(f"      予測内訳: {breakdown}　／　霧確率の最大: {max_prob:.0f}%")
 
     print(f"\n{len(generated_paths)}地点分の予測グラフを生成しました（{out_dir} 内）。")
@@ -2225,9 +2962,11 @@ def run_fog_prediction_addon(main_df, phenom_df, phenom_cols, location_name, out
     summary_path = plot_all_location_summary(pred_df, models, location_mapping, location_name,
                                              out_dir, prob_df=prob_df)
     print(f"全地点サマリーグラフ: {os.path.basename(summary_path)}")
-    csv_path = export_prediction_csv(pred_df, prob_df, models, location_mapping, location_name, out_dir)
-    print(f"予測結果CSV        : {os.path.basename(csv_path)}")
-    return generated_paths + [summary_path, csv_path]
+    csv_path, csv_wide_path = export_prediction_csv(
+        pred_df, prob_df, models, location_mapping, location_name, out_dir)
+    print(f"予測結果CSV        : {os.path.basename(csv_path)}"
+          f"（横持ち版: {os.path.basename(csv_wide_path)}）")
+    return generated_paths + [summary_path, csv_path, csv_wide_path]
 
 
 # ===========================================================================
@@ -2305,8 +3044,15 @@ def _parse_args(argv=None):
     parser.add_argument("--model", choices=list(MODEL_KINDS), default=DEFAULT_MODEL_KIND,
                         help="学習モデル（hybrid=RandomForest+XGBoostの加重平均 / "
                              "rf=RandomForest単独＝従来と同じ速さ / xgb=XGBoost単独）")
+    parser.add_argument("--model-cache", default=None,
+                        help="学習済みモデルの保存/再利用先ファイル（.joblib）。"
+                             "指定すると2回目以降は学習を省略できる")
+    parser.add_argument("--location-coords", default=None,
+                        help="地点名,緯度,経度の列を持つCSV。指定すると地点ごとに予報を取得する"
+                             "（未指定なら全地点で --lat/--lon の1地点分の予報を共用）")
     parser.add_argument("--no-forecast", action="store_true", help="霧予測（④⑤⑥）を行わない")
     parser.add_argument("--no-monthly", action="store_true", help="月別グラフ（①②）を作らない")
+    parser.add_argument("--no-log", action="store_true", help="実行ログのファイル保存をしない")
     parser.add_argument("--font", default=None,
                         help="グラフに使う日本語フォント名（例: IPAexGothic）")
     parser.add_argument("--check-font", action="store_true",
@@ -2392,10 +3138,26 @@ def zip_outputs(out_dir, download: bool = False):
     return zip_path
 
 
+class _TeeOutput:
+    """print()の出力を、画面と実行ログファイルの両方に同時に書き出す。"""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, s):
+        for st in self.streams:
+            st.write(s)
+
+    def flush(self):
+        for st in self.streams:
+            st.flush()
+
+
 def run(input_file=None, output_dir=None, sheet=None, layout="auto",
         lat=None, lon=None, forecast_days=None, history_days=5,
         forecast=True, monthly=True, font=None, show=None,
-        zip_output=False, download=False, model=DEFAULT_MODEL_KIND):
+        zip_output=False, download=False, model=DEFAULT_MODEL_KIND,
+        model_cache=None, location_coords_file=None, save_log=True):
     """Colabのセルから直接呼べるエントリーポイント。
 
         from weather_visualizer import run
@@ -2405,6 +3167,11 @@ def run(input_file=None, output_dir=None, sheet=None, layout="auto",
     zip_output=True で出力フォルダをZIPにまとめる（download=Trueでダウンロードまで）。
     model="hybrid"（既定）はRandomForestとXGBoostのハイブリッド、"rf" / "xgb" で
     片方だけを使う（"rf" は従来と同じ速さ）。
+    model_cache に .joblib のパスを指定すると、学習済みモデルを保存/再利用できる
+    （2回目以降はモデル学習を省略してグラフだけ作り直せる）。
+    location_coords_file に「地点名,緯度,経度」のCSVを指定すると、地点ごとに
+    予報を取得する（未指定なら全地点で lat/lon の1地点分の予報を共用する）。
+    save_log=False にすると実行ログ（実行ログ_日時.txt）をファイルに保存しない。
     """
     if font:
         setup_japanese_font(font_name=font)
@@ -2420,33 +3187,49 @@ def run(input_file=None, output_dir=None, sheet=None, layout="auto",
         )
 
     os.makedirs(out_dir, exist_ok=True)
-    print(f"ファイルを読み込み中: {filepath}")
-    main_df, phenom_df, phenom_cols, location_mapping = load_weather_data(
-        filepath, sheet_name=sheet, layout=layout)
 
-    base = os.path.splitext(os.path.basename(filepath))[0]
-    location_name = base.split("_")[0].split(" ")[0] if ("_" in base or " " in base) else base
+    log_path = None
+    original_stdout = sys.stdout
+    log_file = None
+    if save_log:
+        log_path = os.path.join(out_dir, f"実行ログ_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+        log_file = open(log_path, "w", encoding="utf-8")
+        sys.stdout = _TeeOutput(original_stdout, log_file)
 
-    generated = []
-    if monthly:
-        print(f"\n月ごと・全地点統合グラフの生成を開始します（{len(phenom_cols)}地点）...")
-        made = plot_combo_by_month(main_df, phenom_df, phenom_cols, location_mapping,
-                                   location_name, out_dir)
-        generated += made
-        print(f"月別グラフを{len(made)}枚生成しました。出力先: {os.path.abspath(out_dir)}")
-    else:
-        print("\n月別グラフ（①②）の生成はスキップしました。")
+    try:
+        print(f"ファイルを読み込み中: {filepath}")
+        main_df, phenom_df, phenom_cols, location_mapping = load_weather_data(
+            filepath, sheet_name=sheet, layout=layout)
 
-    if forecast:
-        generated += run_fog_prediction_addon(
-            main_df, phenom_df, phenom_cols, location_name, out_dir, location_mapping,
-            lat=lat, lon=lon, forecast_days=forecast_days, history_days=history_days,
-            model=model,
-        )
-    else:
-        print("\n霧予測（④⑤⑥）の生成はスキップしました。")
+        base = os.path.splitext(os.path.basename(filepath))[0]
+        location_name = base.split("_")[0].split(" ")[0] if ("_" in base or " " in base) else base
 
-    print(f"\n完了しました。出力先フォルダ: {os.path.abspath(out_dir)}")
+        generated = []
+        if monthly:
+            print(f"\n月ごと・全地点統合グラフの生成を開始します（{len(phenom_cols)}地点）...")
+            made = plot_combo_by_month(main_df, phenom_df, phenom_cols, location_mapping,
+                                       location_name, out_dir)
+            generated += made
+            print(f"月別グラフを{len(made)}枚生成しました。出力先: {os.path.abspath(out_dir)}")
+        else:
+            print("\n月別グラフ（①②）の生成はスキップしました。")
+
+        if forecast:
+            generated += run_fog_prediction_addon(
+                main_df, phenom_df, phenom_cols, location_name, out_dir, location_mapping,
+                lat=lat, lon=lon, forecast_days=forecast_days, history_days=history_days,
+                model=model, model_cache=model_cache, location_coords_file=location_coords_file,
+            )
+        else:
+            print("\n霧予測（④⑤⑥）の生成はスキップしました。")
+
+        print(f"\n完了しました。出力先フォルダ: {os.path.abspath(out_dir)}")
+        if log_path:
+            print(f"実行ログを保存しました: {log_path}")
+    finally:
+        sys.stdout = original_stdout
+        if log_file:
+            log_file.close()
 
     if show is None:
         show = _in_notebook()  # ノートブックなら既定で表示する
@@ -2476,7 +3259,9 @@ def main(argv=None):
         run(input_file=args.input, output_dir=args.output, sheet=args.sheet, layout=args.layout,
             lat=args.lat, lon=args.lon, forecast_days=args.forecast_days,
             history_days=args.history_days, forecast=not args.no_forecast,
-            monthly=not args.no_monthly, zip_output=args.zip, model=args.model)
+            monthly=not args.no_monthly, zip_output=args.zip, model=args.model,
+            model_cache=args.model_cache, location_coords_file=args.location_coords,
+            save_log=not args.no_log)
     except FileNotFoundError as e:
         print(f"【エラー】{e}")
         return 1

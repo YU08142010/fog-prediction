@@ -493,6 +493,98 @@ class TestFetchForecast(unittest.TestCase):
         self.assertFalse(df["気温(℃)"].isna().any())
         self.assertEqual(df["降水量(mm)"].iloc[6], 0.0)
 
+    def test_optional_measures_are_unit_converted(self):
+        """日照時間(秒→時間)・日射量(W/m2→MJ/m2)・視程(m→km)の単位換算を確認する。"""
+        payload = _fake_forecast_payload(6)
+        n = len(payload["hourly"]["time"])
+        payload["hourly"]["sunshine_duration"] = [1800.0] * n     # 1800秒=0.5時間
+        payload["hourly"]["shortwave_radiation"] = [100.0] * n    # 100W/m2 -> 0.36MJ/m2
+        payload["hourly"]["visibility"] = [5000.0] * n            # 5000m -> 5km
+        payload["hourly"]["surface_pressure"] = [1013.0] * n
+
+        with mock.patch.object(wv.requests, "get", lambda *a, **k: _FakeResponse(payload)):
+            df = wv.fetch_forecast_range()
+
+        self.assertTrue(np.allclose(df["日照時間(時間)"], 0.5))
+        self.assertTrue(np.allclose(df["日射量(MJ/m2)"], 0.36))
+        self.assertTrue(np.allclose(df["視程(km)"], 5.0))
+        self.assertTrue(np.allclose(df["気圧(hPa)"], 1013.0))
+
+    def test_fetch_forecast_multi_maps_by_location_name(self):
+        """複数地点の緯度経度をまとめて渡すと、地点名ごとのDataFrameが返ること。"""
+        payloads = [_fake_forecast_payload(6), _fake_forecast_payload(6)]
+        payloads[1]["hourly"]["temperature_2m"] = [99.0] * len(payloads[1]["hourly"]["time"])
+
+        class _MultiResponse:
+            def __init__(self, data):
+                self._data = data
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return self._data
+
+        with mock.patch.object(wv.requests, "get", lambda *a, **k: _MultiResponse(payloads)):
+            result = wv.fetch_forecast_multi({"地点A": (37.0, 139.0), "地点B": (37.1, 139.1)})
+
+        self.assertEqual(set(result.keys()), {"地点A", "地点B"})
+        self.assertTrue((result["地点B"]["気温(℃)"] == 99.0).all())
+        self.assertFalse((result["地点A"]["気温(℃)"] == 99.0).all())
+
+
+class TestLocationCoordinates(unittest.TestCase):
+    def test_load_location_coordinates(self):
+        tmpdir = tempfile.mkdtemp(prefix="wv_coords_")
+        try:
+            path = os.path.join(tmpdir, "coords.csv")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("地点名,緯度,経度\n只見,37.3,139.3\n田子倉,37.4,139.2\n")
+            coords = wv.load_location_coordinates(path)
+            self.assertEqual(coords, {"只見": (37.3, 139.3), "田子倉": (37.4, 139.2)})
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_missing_lat_lon_columns_raises(self):
+        tmpdir = tempfile.mkdtemp(prefix="wv_coords_")
+        try:
+            path = os.path.join(tmpdir, "bad.csv")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("地点名,x,y\n只見,1,2\n")
+            with self.assertRaises(ValueError):
+                wv.load_location_coordinates(path)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_fetch_per_location_forecasts_matches_by_name_and_falls_back(self):
+        """座標ファイルにある地点だけ専用の予報を使い、無い地点は既定にフォールバックすること。"""
+        tmpdir = tempfile.mkdtemp(prefix="wv_coords_")
+        try:
+            path = os.path.join(tmpdir, "coords.csv")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("地点名,緯度,経度\n地点甲,37.0,139.0\n")
+
+            default_forecast = wv._forecast_payload_to_df(_fake_forecast_payload(6)["hourly"])
+            own_payload = _fake_forecast_payload(6)
+            own_payload["hourly"]["temperature_2m"] = [55.0] * len(own_payload["hourly"]["time"])
+
+            class _MultiResponse:
+                def raise_for_status(self):
+                    pass
+
+                def json(self):
+                    return [own_payload]
+
+            with mock.patch.object(wv.requests, "get", lambda *a, **k: _MultiResponse()):
+                forecast_by_col = wv._fetch_per_location_forecasts(
+                    path, ["AC", "AD"], {"AC": "地点甲", "AD": "地点乙"}, 2, default_forecast)
+
+            self.assertIn("AC", forecast_by_col)
+            self.assertNotIn("AD", forecast_by_col)  # 座標ファイルに無い地点は既定にフォールバック
+            self.assertTrue((forecast_by_col["AC"]["気温(℃)"] == 55.0).all())
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
 
 # ---------------------------------------------------------------------------
 # 学習・予測・グラフ出力（エンドツーエンド）
@@ -613,6 +705,121 @@ class TestXGBLabelSafeClassifier(unittest.TestCase):
         self.assertEqual(clf.predict_proba(X).shape, (120, 3))
 
 
+class TestDisplayWidth(unittest.TestCase):
+    """表の桁揃え（`_disp_width`/`_pad`）。全角混在でも表示幅で揃うことを確認する。"""
+
+    def test_disp_width_counts_full_width_as_two(self):
+        self.assertEqual(wv._disp_width("木賊"), 4)
+        self.assertEqual(wv._disp_width("AC12"), 4)
+        self.assertEqual(wv._disp_width("伊奈川合流地点"), 14)
+
+    def test_pad_aligns_by_display_width_not_char_count(self):
+        short = wv._pad("木賊", 14)
+        long_name = wv._pad("伊奈川合流地点", 14)
+        self.assertEqual(wv._disp_width(short), 14)
+        self.assertEqual(wv._disp_width(long_name), 14)
+
+    def test_pad_right_align(self):
+        self.assertEqual(wv._pad("1", 4, ">"), "   1")
+
+
+class TestFogThreshold(unittest.TestCase):
+    def test_threshold_defaults_when_no_fog_in_validation(self):
+        model = _StubModel([0, 2], [[0.9, 0.1]] * 5)
+        y_val = pd.Series([0, 0, 0, 0, 0])
+        self.assertEqual(wv._choose_fog_threshold(model, np.zeros((5, 1)), y_val),
+                         wv.DEFAULT_FOG_THRESHOLD)
+
+    def test_threshold_picks_separating_value(self):
+        # 前半は霧なし（確率低）、後半は霧あり（確率高）の分かりやすいケース
+        proba = np.array([[0.9, 0.1]] * 5 + [[0.1, 0.9]] * 5)
+        model = _StubModel([0, 2], proba)
+        y_val = pd.Series([0] * 5 + [2] * 5)
+        t = wv._choose_fog_threshold(model, np.zeros((10, 1)), y_val)
+        self.assertGreater(t, 0.1)
+        self.assertLess(t, 0.9)
+
+
+class TestLagAndSunFeatures(unittest.TestCase):
+    def test_lag_series_uses_exact_time_lookup_not_position(self):
+        """行が飛んでいる（欠測）場合、位置ベースではなく時刻ベースで過去の値を探すこと。"""
+        times = pd.to_datetime(["2026-01-01 00:00", "2026-01-01 01:00",
+                                "2026-01-01 03:00"])  # 2時が欠けている
+        df = pd.DataFrame({"datetime": times, "気温(℃)": [10.0, 12.0, 20.0]})
+        lagged = wv._lag_series(df, "気温(℃)", 1)
+        self.assertEqual(lagged.iloc[1], 10.0)   # 1時の1時間前=0時は存在する
+        self.assertTrue(np.isnan(lagged.iloc[2]))  # 3時の1時間前=2時は存在しない
+
+    def test_add_lag_features_fills_gaps_after_prepare_features(self):
+        main_df, _, _, _ = _synthetic_observations(n_days=3)
+        out, feature_names = wv.prepare_features(main_df)
+        for name in wv.LAG_FEATURE_NAMES:
+            self.assertIn(name, feature_names)
+            self.assertFalse(out[name].isna().any(), name)
+
+    def test_sunrise_feature_is_zero_during_broad_daytime_and_bounded(self):
+        main_df, _, _, _ = _synthetic_observations(n_days=2)
+        out = wv._add_sunrise_feature(main_df)
+        noon_mask = main_df["datetime"].dt.hour == 12
+        self.assertTrue((out.loc[noon_mask, wv.SUN_FEATURE_NAME] == 0.0).all())
+        self.assertTrue((out[wv.SUN_FEATURE_NAME] >= 0).all())
+        self.assertTrue((out[wv.SUN_FEATURE_NAME] <= 12).all())
+
+
+class TestOptionalMeasureFeatures(unittest.TestCase):
+    def test_low_coverage_optional_measure_is_excluded(self):
+        main_df, _, _, _ = _synthetic_observations(n_days=5)
+        main_df["気圧(hPa)"] = np.nan
+        main_df.loc[main_df.index[:2], "気圧(hPa)"] = 1013.0  # 有効値がごくわずか
+        out, feature_names = wv.prepare_features(main_df)
+        self.assertNotIn("気圧(hPa)", feature_names)
+
+    def test_high_coverage_optional_measure_is_included_and_filled(self):
+        main_df, _, _, _ = _synthetic_observations(n_days=5)
+        main_df["気圧(hPa)"] = 1013.0
+        main_df.loc[main_df.index[0], "気圧(hPa)"] = np.nan
+        out, feature_names = wv.prepare_features(main_df)
+        self.assertIn("気圧(hPa)", feature_names)
+        self.assertFalse(out["気圧(hPa)"].isna().any())
+
+
+class TestPooledFallbackModel(unittest.TestCase):
+    def test_data_poor_location_is_rescued_by_pooled_model(self):
+        """個別条件を満たさない地点でも、共通モデルでmodelsに追加されること。"""
+        main_df, phenom_df, cols, mapping = _synthetic_observations(n_days=60)
+        # AD地点はデータ不足になるよう大半を欠測にする
+        phenom_df = phenom_df.copy()
+        phenom_df.loc[phenom_df.index[50:], "AD"] = ""
+        models = wv.train_location_models(main_df, phenom_df, cols, mapping, model="rf")
+        self.assertIn("AC", models)
+        self.assertIn("AD", models)
+        self.assertTrue(models["AD"]["model_type"].startswith("pooled"))
+        self.assertTrue(models["AD"]["pooled"])
+        self.assertFalse(models["AC"]["pooled"])
+        # rf_pipe/xgb_pipeは内部専用のキーなので、戻り値には残らないこと
+        self.assertNotIn("rf_pipe", models["AC"])
+        self.assertNotIn("xgb_pipe", models["AC"])
+
+
+class TestModelCache(unittest.TestCase):
+    def test_load_or_train_models_round_trips_through_cache(self):
+        main_df, phenom_df, cols, mapping = _synthetic_observations(n_days=30)
+        tmpdir = tempfile.mkdtemp(prefix="wv_cache_")
+        try:
+            cache_path = os.path.join(tmpdir, "models.joblib")
+            self.assertFalse(os.path.isfile(cache_path))
+            models = wv.load_or_train_models(main_df, phenom_df, cols, mapping, "rf", cache_path)
+            self.assertTrue(os.path.isfile(cache_path))
+
+            # 2回目は保存済みファイルを読み込むだけで、学習し直さないこと
+            with mock.patch.object(wv, "train_location_models") as mocked:
+                reloaded = wv.load_or_train_models(main_df, phenom_df, cols, mapping, "rf", cache_path)
+                mocked.assert_not_called()
+            self.assertEqual(set(reloaded.keys()), set(models.keys()))
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 class TestTrainingAndPlots(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -647,11 +854,17 @@ class TestTrainingAndPlots(unittest.TestCase):
                                           self.tmpdir, prob_df=prob_df)
         self.assertTrue(os.path.isfile(p5))
 
-        p6 = wv.export_prediction_csv(pred_df, prob_df, models, self.mapping, "只見", self.tmpdir)
+        p6, p6_wide = wv.export_prediction_csv(pred_df, prob_df, models, self.mapping, "只見", self.tmpdir)
         out = pd.read_csv(p6)
-        self.assertIn("地点甲_予測コード", out.columns)
-        self.assertIn("地点甲_霧確率(%)", out.columns)
-        self.assertEqual(len(out), len(forecast))
+        self.assertEqual(list(out.columns), ["日時", "地点", "予測コード", "現象名", "霧確率(%)", "判定"])
+        self.assertEqual(set(out["地点"]), {"地点甲", "地点乙"})
+        self.assertEqual(len(out), len(forecast) * 2)  # 縦持ち＝地点数ぶん行が増える
+        self.assertTrue(out["判定"].isin(["霧", "-"]).all())
+
+        out_wide = pd.read_csv(p6_wide)
+        self.assertIn("地点甲_予測コード", out_wide.columns)
+        self.assertIn("地点甲_霧確率(%)", out_wide.columns)
+        self.assertEqual(len(out_wide), len(forecast))
 
     def test_monthly_graphs(self):
         made = wv.plot_combo_by_month(self.main_df.head(200), self.phenom_df.head(200),
