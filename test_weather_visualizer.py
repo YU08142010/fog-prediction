@@ -286,33 +286,127 @@ class TestLayoutDetection(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 実データ（data.csv）の読み込み
+# 本番と同じ形式のファイル（test.xlsx）の読み込み
 # ---------------------------------------------------------------------------
 
-@unittest.skipUnless(os.path.isfile("data.csv"), "data.csv がありません")
-class TestLoadRealCsv(unittest.TestCase):
+SAMPLE_XLSX = "test.xlsx"
+
+
+@unittest.skipUnless(os.path.isfile(SAMPLE_XLSX), f"{SAMPLE_XLSX} がありません")
+class TestLoadSampleXlsx(unittest.TestCase):
+    """見出し行の下に小見出し行（風向・品質情報）が続く、本番と同じ形式。"""
+
     @classmethod
     def setUpClass(cls):
         cls.main_df, cls.phenom_df, cls.cols, cls.mapping = wv.load_weather_data(
-            "data.csv", verbose=False)
+            SAMPLE_XLSX, verbose=False)
 
-    def test_all_rows_are_parsed(self):
-        # 2160行すべてが日時として解釈できること（旧版はすべてNaTで消えていた）
-        self.assertEqual(len(self.main_df), 2160)
-        self.assertEqual(self.main_df["datetime"].min(), pd.Timestamp("2024-06-28 01:00"))
-        # 最終行は「2024年9月25日24時」＝ 9/26 0時
-        self.assertEqual(self.main_df["datetime"].max(), pd.Timestamp("2024-09-26 00:00"))
+    def test_all_data_rows_are_parsed(self):
+        # 小見出し行を飛ばし、データ行だけを読むこと（以前は日時なしの2行が混ざっていた）
+        self.assertEqual(len(self.main_df), 17520)
+        self.assertEqual(self.main_df["datetime"].min(), pd.Timestamp("2024-06-01 01:00"))
+        self.assertEqual(self.main_df["datetime"].max(), pd.Timestamp("2026-06-01 00:00"))
 
     def test_locations_detected(self):
-        self.assertEqual(list(self.mapping.values()),
-                         ["伊南川合流点", "柴倉橋", "堅盤橋", "蒲生水道橋"])
+        self.assertEqual(len(self.mapping), 32)
+        self.assertEqual(list(self.mapping.values())[:4],
+                         ["伊奈川合流地点", "柴倉橋", "堅盤橋", "蒲生水道橋"])
+        # 品質情報・均質番号・視程などの補助列が地点として混ざっていないこと
+        self.assertFalse([n for n in self.mapping.values()
+                          if any(k in n for k in ("品質", "均質", "視程", "水温"))])
 
     def test_measures_detected(self):
-        self.assertGreater(self.main_df["気温(℃)"].notna().sum(), 2000)
-        self.assertGreater(self.main_df["相対湿度(％)"].notna().sum(), 2000)
-        self.assertGreater(self.main_df[wv.WIND_DIR_LABEL].notna().sum(), 1900)
-        # 降水量の列は無いのでNaN列になる（例外にはならない）
-        self.assertEqual(self.main_df["降水量(mm)"].notna().sum(), 0)
+        for label in ("気温(℃)", "降水量(mm)", "風速(m/s)", "露点温度(℃)", "相対湿度(％)"):
+            self.assertGreater(self.main_df[label].notna().sum(), 17000, label)
+
+    def test_wind_direction_is_detected_below_header(self):
+        # 風向は見出し行の【下】の行に書かれている（以前は見落として特徴量から欠けていた）
+        self.assertIn(wv.WIND_DIR_LABEL, self.main_df.columns)
+        self.assertGreater(self.main_df[wv.WIND_DIR_LABEL].notna().sum(), 16000)
+
+
+# ---------------------------------------------------------------------------
+# 地点ではない列（水温など）を学習に混ぜない
+# ---------------------------------------------------------------------------
+
+def _write_production_style_xlsx(path, extra_headers=(), extra_values=()):
+    """本番（test.xlsx）と同じ形の小さなExcelを作る。
+
+    extra_headers / extra_values に列を足すと、地点列の右に別の列がある状態を作れる。
+    """
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["ダウンロードした時刻:2026/06/30 17:09:05"])
+    ws.append([])
+    ws.append(["", "只見", "只見", "只見", "只見", "只見", "只見", "",
+               "A橋", "B橋", *extra_headers])
+    ws.append(["年月日時", "気温(°C)", "降水量(mm)", "風速(m/s)", "風速(m/s)",
+               "露点温度(°C)", "相対湿度(%)"])
+    ws.append(["", "", "", "", "風向"])                      # 小見出し行1
+    ws.append(["", "品質情報", "", "品質情報", "", "", ""])   # 小見出し行2
+    for i in range(300):
+        t = datetime(2024, 6, 1) + pd.Timedelta(hours=i)
+        ws.append([t, 20.0, 0.0, 1.2, "南南西", 18.0, 90,
+                   None, "/" if i % 5 else 2, "/" if i % 7 else 1,
+                   *[v(i) for v in extra_values]])
+    wb.save(path)
+
+
+class TestNonLocationColumns(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="wv_cols_")
+        self.path = os.path.join(self.tmpdir, "sample.xlsx")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_water_temperature_column_is_not_a_location(self):
+        """「水温」の列を地点として学習しないこと（8.2→コード8 と誤読させない）。"""
+        _write_production_style_xlsx(
+            self.path,
+            extra_headers=["水温", "水温(℃)"],
+            extra_values=[lambda i: round(8.0 + (i % 40) * 0.05, 1),
+                          lambda i: round(9.0 + (i % 40) * 0.05, 1)],
+        )
+        _, _, cols, mapping = wv.load_weather_data(self.path, verbose=False)
+        self.assertEqual(list(mapping.values()), ["A橋", "B橋"])
+        self.assertEqual(len(cols), 2)
+
+    def test_unnamed_measure_column_is_rejected_by_its_values(self):
+        """見出しからは判別できない列でも、中身が現象コードでなければ地点にしない。"""
+        _write_production_style_xlsx(
+            self.path,
+            extra_headers=["取水口"],                       # 地点名に見える見出し
+            extra_values=[lambda i: round(12.3 + i * 0.01, 2)],
+        )
+        grid = wv.read_grid(self.path)
+        info = wv.detect_layout(grid, wv.find_header_row(grid))
+        names = [name for _, _, name in info["phenom"]]
+        self.assertEqual(names, ["A橋", "B橋"])
+        excluded = [(letter, name) for letter, name, _ in info["excluded"]]
+        self.assertIn("取水口", [name for _, name in excluded])
+
+    def test_location_column_without_data_is_kept(self):
+        """まだ記入されていない地点の列は、これから使うので残すこと。"""
+        _write_production_style_xlsx(self.path, extra_headers=["C橋"],
+                                     extra_values=[lambda i: None])
+        _, _, _, mapping = wv.load_weather_data(self.path, verbose=False)
+        self.assertEqual(list(mapping.values()), ["A橋", "B橋", "C橋"])
+
+    def test_phenomena_value_check(self):
+        for good in ("/", "2", "10", "1 8", 0, 7, 10.0):
+            self.assertTrue(wv._is_phenomena_value(good), good)
+        for bad in ("8.2", "15", "12.5", 8.2, 15, "晴", -1):
+            self.assertFalse(wv._is_phenomena_value(bad), bad)
+
+    def test_measure_header_detects_units(self):
+        self.assertTrue(wv._is_measure_header(["水温(℃)"]))
+        self.assertTrue(wv._is_measure_header(["積算値(mm)"]))
+        # 括弧付きの地点名は地点のまま（単位ではない）
+        self.assertFalse(wv._is_measure_header(["(川口橋)"]))
+        self.assertFalse(wv._is_measure_header(["蒲生水道橋"]))
 
 
 # ---------------------------------------------------------------------------
@@ -703,14 +797,15 @@ class TestMainEndToEnd(unittest.TestCase):
 # Colab向けのエントリーポイント run()
 # ---------------------------------------------------------------------------
 
-@unittest.skipUnless(os.path.isfile("data.csv"), "data.csv がありません")
+@unittest.skipUnless(os.path.isfile(SAMPLE_XLSX), f"{SAMPLE_XLSX} がありません")
 class TestRunApi(unittest.TestCase):
     def test_run_generates_files(self):
         tmpdir = tempfile.mkdtemp(prefix="wv_run_")
         try:
             with mock.patch.object(wv.requests, "get",
                                    lambda *a, **k: _FakeResponse(_fake_forecast_payload(48))):
-                made = wv.run("data.csv", tmpdir, monthly=False, show=False)
+                # 学習方法の切り替えは別のテストで見るので、ここは速いrfで通す
+                made = wv.run(SAMPLE_XLSX, tmpdir, monthly=False, show=False, model="rf")
             self.assertTrue(made)
             for p in made:
                 self.assertTrue(os.path.isfile(p), p)

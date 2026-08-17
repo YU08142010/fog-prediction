@@ -8,6 +8,8 @@
   → 既定では見出し行の文字から【自動検出】します（--layout auto）。
     自動検出に失敗する場合は --layout fixed で従来どおりの固定列
     （A=日時, B=気温, E=降水量, H=風速, S=露点温度, V=相対湿度, AC〜BH=現象コード）を使えます。
+  → 見出し行の【下】に続く小見出し行（「風向」「品質情報」など）も見出しとして読み、
+    データ行としては読み飛ばします。
 
 【現象コード（地点ごとに1列）】
   "/"      = その時刻に現象なし（コード0として扱う）
@@ -16,6 +18,8 @@
       1  薄い川霧    2  川霧      3  濃い川霧
       4  薄い全体霧  5  全体霧    6  全体濃い霧
       7  薄い層雲    8  濃い層雲  9  霧雨        10 雨
+  → 地点の列かどうかは見出しと中身の両方で確かめます。水温のように「/」でも1〜10でもない
+    値が並ぶ列は地点とみなさず、除外した理由を実行時に表示します。
 
 【予測モデル】
   地点ごとに RandomForest と XGBoost を学習し、予測確率を加重平均するハイブリッド。
@@ -422,13 +426,28 @@ WIND_DIR_LABEL = "風向"
 WIND_DIR_KEYWORDS = ["風向"]
 DATETIME_KEYWORDS = ["年月日時", "年月日", "日時", "日付", "時刻"]
 
-# 気象庁データに含まれる補助列（これらは観測地点ではないので現象コード列とみなさない）
+# 気象庁データや観測記録に含まれる補助列（これらは観測地点ではないので現象コード列とみなさない）
 NON_LOCATION_KEYWORDS = [
     "品質情報", "均質番号", "現象なし情報", "備考", "合計", "平均", "最大", "最小",
     "天気", "雲量", "視程", "日照", "積雪", "降雪", "気圧", "蒸気圧", "番号", "単位",
+    "水温", "水位", "流量", "流速", "波高", "潮位", "日射",
 ]
 
+# 「〜(℃)」「〜(mm)」のように単位が付いた見出しは観測値の列であって地点名ではない。
+# 地点名にも括弧が使われる（例:「(川口橋)」）ため、中身が単位のときだけ弾く。
+MEASURE_UNIT_PATTERN = re.compile(
+    r"[（(]\s*(℃|°C|度|℉|mm|cm|m/s|m/秒|%|％|km|hPa|MJ/m2|MJ/㎡|W/m2|時間|分|秒)\s*[）)]"
+)
+
+# 現象コード列かどうかを中身で確かめるときの許容範囲。
+# 「/」でも 0〜10 の整数でもない値がこの割合を超えたら、地点の列ではないと判断する
+# （例: 水温の列は 8.2 や 15.7 といった小数が並ぶ。整数部分だけ見ると 8＝濃い層雲 として
+#  学習されてしまうため、必ず中身まで確認する）。
+PHENOM_INVALID_TOLERANCE = 0.1
+PHENOM_CHECK_MAX_VALUES = 3000  # 判定に使う値の上限（大きなファイルでも速く終わらせるため）
+
 MAX_HEADER_SEARCH_ROWS = 15
+MAX_SUBHEADER_ROWS = 3  # 見出し行の下に続く小見出し行（風向・品質情報など）の最大数
 
 PHENOM_LABELS = {
     1: "薄い川霧", 2: "川霧", 3: "濃い川霧", 4: "薄い全体霧", 5: "全体霧",
@@ -714,10 +733,29 @@ def find_header_row(grid, keyword="年月日時", max_search_rows=MAX_HEADER_SEA
     return 0
 
 
-def _header_texts(grid, col_idx, header_row):
-    """その列の見出し（見出し行までの各行の文字）を上から並べて返す。"""
-    return [t for r in range(0, header_row + 1)
-            if (t := _cell_text(_grid_get(grid, r, col_idx)))]
+def _header_texts(grid, col_idx, header_row, sub_rows=()):
+    """その列の見出し（見出し行までの各行の文字＋小見出し行の文字）を上から並べて返す。
+
+    気象庁形式では「風向」のように、見出し行の【下】の行に書かれている項目がある。
+    sub_rows（`_find_subheader_rows()` の戻り値）を渡すとその行も見出しとして扱う。
+    """
+    rows = list(range(0, header_row + 1)) + list(sub_rows)
+    return [t for r in rows if (t := _cell_text(_grid_get(grid, r, col_idx)))]
+
+
+def _find_subheader_rows(grid, header_row, dt_col):
+    """見出し行のすぐ下に続く「小見出し行」の行番号を返す。
+
+    気象庁のExcelは見出し行の下に「風向」「品質情報」などの補助的な見出しが
+    1〜2行続く。データ行には必ず日時が入っているので、日時の欄が空のあいだを
+    小見出し行とみなす（これらは日時として解釈できない行として毎回除外されていた）。
+    """
+    rows = []
+    for r in range(header_row + 1, min(header_row + 1 + MAX_SUBHEADER_ROWS, len(grid))):
+        if _cell_text(_grid_get(grid, r, dt_col)):
+            break
+        rows.append(r)
+    return rows
 
 
 def _is_metadata_header(texts):
@@ -726,7 +764,52 @@ def _is_metadata_header(texts):
 
 def _is_measure_header(texts):
     all_keys = [k for keys in MEASURE_KEYWORDS.values() for k in keys] + WIND_DIR_KEYWORDS + DATETIME_KEYWORDS
-    return any(any(kw in t for kw in all_keys) for t in texts)
+    if any(any(kw in t for kw in all_keys) for t in texts):
+        return True
+    # 「水温(℃)」のように既知のキーワードに無い観測項目でも、単位が付いていれば観測値の列
+    return any(MEASURE_UNIT_PATTERN.search(t) for t in texts)
+
+
+def _is_phenomena_value(value):
+    """そのセルの値が現象コードとして自然か（「/」または0〜10の整数か）を判定する。
+
+    「1 8」のように1セルに複数コードが書かれる記法も現象コードとして扱う。
+    小数（8.2 など）や11以上の数値は現象コードではない＝地点の列ではない目印になる。
+    """
+    if isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, bool):
+        v = float(value)
+        return (not np.isnan(v)) and float(v).is_integer() and 0 <= v <= 10
+
+    s = _cell_text(value)
+    if not s:
+        return False  # 空欄は呼び出し側で除外済み
+    if s == "/":
+        return True
+    tokens = [t for t in re.split(r"[\s,、/／・]+", s) if t]
+    if not tokens:
+        return False
+    return all(re.fullmatch(r"\d{1,2}", t) and int(t) <= 10 for t in tokens)
+
+
+def _check_phenomena_column(grid, col_idx, data_start):
+    """現象コードの列（＝観測地点の列）らしいかを、実際に入っている値から確かめる。
+
+    戻り値: (地点の列とみなしてよいか, 現象コードではなかった値の例)
+    値が1つも入っていない列は「これから記入する地点」の可能性があるので通す。
+    """
+    bad, n_values = [], 0
+    for r in range(data_start, len(grid)):
+        value = _grid_get(grid, r, col_idx)
+        if value is None or _cell_text(value) == "":
+            continue
+        n_values += 1
+        if not _is_phenomena_value(value):
+            bad.append(_cell_text(value))
+        if n_values >= PHENOM_CHECK_MAX_VALUES:
+            break
+    if n_values == 0:
+        return True, []
+    return len(bad) <= n_values * PHENOM_INVALID_TOLERANCE, list(dict.fromkeys(bad))[:5]
 
 
 def detect_layout(grid, header_row, layout="auto"):
@@ -737,12 +820,13 @@ def detect_layout(grid, header_row, layout="auto"):
 
     戻り値: {"datetime": 列番号, "measures": {ラベル: 列番号|None},
              "wind_dir": 列番号|None, "phenom": [(列文字, 列番号, 地点名), ...],
+             "excluded": [(列文字, 見出し, 除外理由), ...], "data_start": データ開始行,
              "source": "auto"|"fixed"}
     """
     width = _grid_width(grid)
 
     if layout == "fixed":
-        return _fixed_layout(grid, width)
+        return _fixed_layout(grid, width, header_row)
 
     dt_col = None
     for c in range(width):
@@ -753,12 +837,16 @@ def detect_layout(grid, header_row, layout="auto"):
     if dt_col is None:
         dt_col = 0
 
+    # 見出し行の下に続く小見出し行（「風向」など）も見出しとして読む
+    sub_rows = _find_subheader_rows(grid, header_row, dt_col)
+    data_start = header_row + 1 + len(sub_rows)
+
     measures = {label: None for label in MEASURE_KEYWORDS}
     wind_dir_col = None
     for c in range(width):
         if c == dt_col:
             continue
-        texts = _header_texts(grid, c, header_row)
+        texts = _header_texts(grid, c, header_row, sub_rows)
         if not texts or _is_metadata_header(texts):
             continue
         for label, keywords in MEASURE_KEYWORDS.items():
@@ -776,50 +864,80 @@ def detect_layout(grid, header_row, layout="auto"):
 
     # 気象要素より右にあり、名前が付いていて、補助列でもない列を観測地点とみなす
     phenom = []
+    excluded = []
     seen_names = {}
     for c in range(last_measure_col + 1, width):
-        texts = _header_texts(grid, c, header_row)
+        letter = get_column_letter(c + 1)
+        texts = _header_texts(grid, c, header_row, sub_rows)
         if not texts or _is_metadata_header(texts) or _is_measure_header(texts):
+            if texts:
+                excluded.append((letter, texts[0], "観測値・補助情報の列（地点名ではない）"))
             continue
         name = texts[0]
         if re.fullmatch(r"[\d\.\-/]+", name):  # 数字だけの見出しは地点名ではない
             continue
+        # 見出しだけでは判断できない列があるため、中身が現象コードかどうかも確かめる
+        # （水温のように「地点名らしい見出し＋数値」の列を学習に混ぜないため）
+        ok, bad_samples = _check_phenomena_column(grid, c, data_start)
+        if not ok:
+            reason = "現象コード（「/」または1〜10）以外の値が多い"
+            if bad_samples:
+                reason += f"（例: {', '.join(bad_samples)}）"
+            excluded.append((letter, name, reason))
+            continue
         if name in seen_names:  # 同名地点は列文字を付けて区別する
-            name = f"{name}({get_column_letter(c + 1)})"
+            name = f"{name}({letter})"
         seen_names[name] = c
-        phenom.append((get_column_letter(c + 1), c, name))
+        phenom.append((letter, c, name))
 
     if not phenom or all(m is None for m in measures.values()):
         # 自動検出がうまくいかなかった場合は従来の固定レイアウトに戻す
-        fixed = _fixed_layout(grid, width)
+        fixed = _fixed_layout(grid, width, header_row)
         if not phenom:
             phenom = fixed["phenom"]
+            excluded = fixed["excluded"]
         for label, col in measures.items():
             if col is None:
                 measures[label] = fixed["measures"].get(label)
         return {"datetime": dt_col, "measures": measures, "wind_dir": wind_dir_col,
-                "phenom": phenom, "source": "auto+fixed"}
+                "phenom": phenom, "excluded": excluded, "data_start": data_start,
+                "source": "auto+fixed"}
 
     return {"datetime": dt_col, "measures": measures, "wind_dir": wind_dir_col,
-            "phenom": phenom, "source": "auto"}
+            "phenom": phenom, "excluded": excluded, "data_start": data_start,
+            "source": "auto"}
 
 
-def _fixed_layout(grid, width):
+def _fixed_layout(grid, width, header_row=None):
     """従来のハードコードされた列レイアウト。"""
     measures = {}
     for letter, label in MAIN_COLUMNS.items():
         measures[label] = column_index_from_string(letter) - 1
     wind_dir_col = column_index_from_string(COL_WIND_DIR) - 1 if COL_WIND_DIR else None
 
+    dt_col = column_index_from_string(COL_DATETIME) - 1
+    if header_row is None:
+        header_row = LOCATION_NAME_ROW - 1
+    data_start = header_row + 1 + len(_find_subheader_rows(grid, header_row, dt_col))
+
     start_idx = column_index_from_string(PHENOMENA_RANGE[0]) - 1
     end_idx = column_index_from_string(PHENOMENA_RANGE[1]) - 1
-    phenom = []
+    phenom, excluded = [], []
     for c in range(start_idx, min(end_idx, width - 1) + 1):
         raw = _cell_text(_grid_get(grid, LOCATION_NAME_ROW - 1, c))
         letter = get_column_letter(c + 1)
-        phenom.append((letter, c, raw if raw else f"地点_{letter}"))
-    return {"datetime": column_index_from_string(COL_DATETIME) - 1, "measures": measures,
-            "wind_dir": wind_dir_col, "phenom": phenom, "source": "fixed"}
+        name = raw if raw else f"地点_{letter}"
+        ok, bad_samples = _check_phenomena_column(grid, c, data_start)
+        if not ok:
+            reason = "現象コード（「/」または1〜10）以外の値が多い"
+            if bad_samples:
+                reason += f"（例: {', '.join(bad_samples)}）"
+            excluded.append((letter, name, reason))
+            continue
+        phenom.append((letter, c, name))
+    return {"datetime": dt_col, "measures": measures, "wind_dir": wind_dir_col,
+            "phenom": phenom, "excluded": excluded, "data_start": data_start,
+            "source": "fixed"}
 
 
 def load_weather_data(filepath, sheet_name=None, layout="auto", verbose=True):
@@ -837,10 +955,12 @@ def load_weather_data(filepath, sheet_name=None, layout="auto", verbose=True):
 
     header_row = find_header_row(grid)
     info = detect_layout(grid, header_row, layout=layout)
-    data_rows = grid[header_row + 1:]
+    # 見出し行の下に小見出し行（風向・品質情報など）がある形式では、そこを飛ばして読む
+    data_start = info.get("data_start", header_row + 1)
+    data_rows = grid[data_start:]
 
     dt_col = info["datetime"]
-    raw_dt = [_grid_get(grid, header_row + 1 + i, dt_col) for i in range(len(data_rows))]
+    raw_dt = [_grid_get(grid, data_start + i, dt_col) for i in range(len(data_rows))]
     dt_series, unparsed = parse_datetime_series(raw_dt)
 
     main_data = {"datetime": dt_series}
@@ -851,11 +971,11 @@ def load_weather_data(filepath, sheet_name=None, layout="auto", verbose=True):
             missing_measures.append(label)
             main_data[label] = pd.Series([np.nan] * len(data_rows), dtype="float64")
         else:
-            values = [_grid_get(grid, header_row + 1 + i, col) for i in range(len(data_rows))]
+            values = [_grid_get(grid, data_start + i, col) for i in range(len(data_rows))]
             main_data[label] = pd.to_numeric(pd.Series(values, dtype="object"), errors="coerce")
 
     if info["wind_dir"] is not None:
-        wd = [_grid_get(grid, header_row + 1 + i, info["wind_dir"]) for i in range(len(data_rows))]
+        wd = [_grid_get(grid, data_start + i, info["wind_dir"]) for i in range(len(data_rows))]
         main_data[WIND_DIR_LABEL] = pd.Series([encode_wind_direction(v) for v in wd], dtype="float64")
 
     phenom_data = {"datetime": dt_series}
@@ -864,7 +984,7 @@ def load_weather_data(filepath, sheet_name=None, layout="auto", verbose=True):
         phenom_cols.append(letter)
         location_mapping[letter] = name
         phenom_data[letter] = pd.Series(
-            [_grid_get(grid, header_row + 1 + i, col) for i in range(len(data_rows))], dtype="object")
+            [_grid_get(grid, data_start + i, col) for i in range(len(data_rows))], dtype="object")
 
     main_df = pd.DataFrame(main_data)
     phenom_df = pd.DataFrame(phenom_data)
@@ -933,6 +1053,15 @@ def _print_load_report(filepath, header_row, info, main_df, phenom_cols, locatio
     print(f"\n  検出した観測地点（{len(phenom_cols)}地点）:")
     for letter in phenom_cols:
         print(f"    {letter}列 → {location_mapping.get(letter, '(不明)')}")
+
+    # 「地点ではない列（水温など）まで学習していないか」を毎回確認できるようにする
+    excluded = info.get("excluded", [])
+    if excluded:
+        print(f"\n  地点として扱わなかった列（{len(excluded)}列）:")
+        for letter, name, reason in excluded[:10]:
+            print(f"    {letter}列 → {name}: {reason}")
+        if len(excluded) > 10:
+            print(f"    （ほか{len(excluded) - 10}列）")
 
 
 def report_phenomena_quality(phenom_df, phenom_cols, location_mapping):

@@ -15,8 +15,8 @@
 | ファイル | 役割 |
 |---|---|
 | `weather_visualizer.py` | 本体（読み込み・グラフ・学習・予測・CLI・Colab支援のすべて） |
-| `test_weather_visualizer.py` | unittest（63件）。ネットワークには接続しない |
-| `data.csv` | 動作確認用のサンプル（只見川流域4地点・2024年6〜9月） |
+| `test_weather_visualizer.py` | unittest（69件）。ネットワークには接続しない |
+| `test.xlsx` | 動作確認用のサンプル（**本番と同じ形式**。只見川流域32地点・2024年6月〜2026年6月。現象コードは仮の値なので予測精度の評価には使えない） |
 | `README.md` | Colab利用者向けの手順書 |
 | `requirements.txt` | pandas / numpy / matplotlib / openpyxl / scikit-learn / xgboost / requests |
 | `review_point.md` | 利用者からの改善要望メモ |
@@ -50,14 +50,14 @@
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# テスト（ネットワーク不要・約12秒）
+# テスト（ネットワーク不要・約35秒）
 python -m unittest test_weather_visualizer
 
 # サンプルデータで動作確認（予測なし＝ネットワーク不要・数秒）
-python -c "from weather_visualizer import run; run('data.csv', forecast=False)"
+python -c "from weather_visualizer import run; run('test.xlsx', forecast=False)"
 
 # 予測まで含めた通し確認（Open-Meteo APIに接続・数十秒）
-python weather_visualizer.py data.csv
+python weather_visualizer.py test.xlsx
 
 # 日本語フォントの確認だけ
 python weather_visualizer.py --check-font
@@ -77,6 +77,8 @@ python weather_visualizer.py --check-font
 ### データの扱いで壊しやすいところ
 
 - 現象コードの `/`（現象なし＝コード0）と**空欄（未入力＝欠測 NaN）は必ず区別**します。混同すると学習データが汚染されます（`encode_phenomena_cell()`）。
+- 見出し行の**下**に続く小見出し行（風向・品質情報）は `_find_subheader_rows()` で飛ばし、`info["data_start"]` からデータを読みます。本番形式では風向がここに書かれているため、この処理を消すと風向の特徴量が黙って失われます。
+- 地点の列かどうかは**見出しと中身の両方**で判定します（`_is_measure_header()` / `_check_phenomena_column()`）。水温の `8.2` は整数部分だけ見ると「8＝濃い層雲」として学習されてしまうため、中身の判定を外さないこと。
 - 気象庁形式の `24時` は**翌日の0時**として扱います（`parse_datetime_value()`）。
 - 降水量は列が無い／空欄なら **0mm** として学習に使います（無降水時に空欄という記録が多いため）。他の要素と同じ扱いにしないこと。
 - Open-Meteo の取得では `wind_speed_unit=ms` を必ず指定します。既定は km/h で、指定を落とすと学習データ（m/s）と単位が食い違い、予測が静かに壊れます。
@@ -96,7 +98,7 @@ python weather_visualizer.py --check-font
 ## 変更後に必ず行うこと
 
 1. `python -m unittest test_weather_visualizer` が `OK` になること
-2. `python weather_visualizer.py data.csv` が最後まで通ること（グラフ・予測を変更した場合）
+2. `python weather_visualizer.py test.xlsx` が最後まで通ること（グラフ・予測を変更した場合）
 3. 利用手順に影響する変更をしたら **README.md も同時に更新**すること
 4. グラフの見た目を変えた場合は、生成された PNG の**日本語が □ になっていないか**を目視確認すること
 
