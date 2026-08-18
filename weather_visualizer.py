@@ -2691,10 +2691,11 @@ def plot_all_location_summary(pred_df, models, location_mapping, location_name, 
 
     x = np.arange(n_days)
     fig_w = max(10, n_days * 0.8)
-    fig_h = 3.0 + max(2.0, n_total * 0.22)
+    bar_ratio, heat_ratio = 3.0, max(2.0, n_total * 0.22)
+    fig_h = bar_ratio + heat_ratio
     fig, (ax_bar, ax_heat) = plt.subplots(
         2, 1, figsize=(fig_w, fig_h), sharex=True,
-        gridspec_kw={"height_ratios": [3.0, max(2.0, n_total * 0.22)], "hspace": 0.08},
+        gridspec_kw={"height_ratios": [bar_ratio, heat_ratio], "hspace": 0.08},
     )
 
     bars = ax_bar.bar(x, counts, color="#3498db", width=0.6, label="霧が予測された地点数")
@@ -2732,7 +2733,11 @@ def plot_all_location_summary(pred_df, models, location_mapping, location_name, 
             if not np.isnan(v) and v >= 50:
                 ax_heat.text(j, i, f"{v:.0f}", ha="center", va="center", fontsize=6,
                              color="white" if v >= 70 else "black")
-    cbar = fig.colorbar(im, ax=[ax_bar, ax_heat], fraction=0.02, pad=0.01)
+    # カラーバーは上下2段から等しく場所を取って（＝x軸の位置をずらさずに）作り、
+    # 帯そのものは下段のヒートマップの高さに揃える。上段いっぱいまで伸ばすと
+    # ラベル「霧確率の最大（％）」が右軸の「霧確率の平均(%)」と重なって読めなくなる。
+    cbar = fig.colorbar(im, ax=[ax_bar, ax_heat], fraction=0.02, pad=0.01,
+                        shrink=heat_ratio / (bar_ratio + heat_ratio), anchor=(0.0, 0.0))
     cbar.set_label("霧確率の最大（％）", fontsize=8)
 
     stamp = dates[0].strftime("%Y%m%d") if dates else "na"
